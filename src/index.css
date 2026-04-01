@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Force dark background at root level */
+body {
+  background-color: #000;
+  color: #d1d5db;
+  min-height: 100vh;
+}
