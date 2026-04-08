@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { createClient } from '@supabase/supabase-js';
 
 // ─── SUPABASE ─────────────────────────────────────────────────────────
@@ -29,34 +29,68 @@ function normaliseTrade(t) {
     if (typeof v === 'string') { try { return JSON.parse(v); } catch { return null; } }
     return null;
   };
+
+  // pipeline column now stores {snapshot:{...}, inp:{...}}
+  // Fall back to treating the whole value as a snapshot for old records
+  const pipeData    = parseSafe(t.pipeline) || {};
+  const snapshot    = pipeData.snapshot
+    ? pipeData.snapshot
+    : (pipeData.POI || pipeData.TIME ? pipeData : parseSafe(t.pipelineSnapshot) || {});
+  const inp         = pipeData.inp || {};
+
+  const screenshots = Array.isArray(t.screenshots)
+    ? t.screenshots
+    : (parseSafe(t.screenshots) || []);
+
   return {
+    // ── Core Supabase columns ──────────────────────────────────────────
     id:               t.id,
-    pair:             t.pair,
-    setup:            t.setup,
-    setupType:        t.setup            || t.setupType,
-    session:          t.session,
-    htfBias:          t.htf_bias         || t.htfBias,
-    direction:        t.direction,
-    poi:              t.poi,
-    poiLocation:      t.poi              || t.poiLocation,
-    liquidity:        t.liquidity,
-    liquidityType:    t.liquidity        ? [t.liquidity] : (t.liquidityType || []),
-    model:            t.model,
-    grade:            t.grade,
-    outcome:          t.outcome,
-    rAchieved:        t.r_achieved       ?? t.rAchieved,
-    notes:            t.notes,
-    pipelineSnapshot: parseSafe(t.pipeline) || parseSafe(t.pipelineSnapshot) || {},
-    pipeline:         parseSafe(t.pipeline) || [],
-    screenshots:      Array.isArray(t.screenshots)
-                        ? t.screenshots
-                        : (parseSafe(t.screenshots) || []),
-    images:           Array.isArray(t.screenshots)
-                        ? t.screenshots
-                        : (parseSafe(t.screenshots) || []),
-    date:             t.trade_date       || t.date,
-    savedAt:          t.created_at       || t.savedAt,
-    isBacktest:       t.backtest         || t.isBacktest || false,
+    pair:             t.pair             || '',
+    setup:            t.setup            || '',
+    setupType:        t.setup            || t.setupType || '',
+    session:          t.session          || '',
+    htfBias:          t.htf_bias         || t.htfBias   || '',
+    direction:        t.direction        || '',
+    poi:              t.poi              || '',
+    liquidity:        t.liquidity        || '',
+    model:            t.model            || '',
+    grade:            t.grade            || '',
+    outcome:          t.outcome          || '',
+    rAchieved:        t.r_achieved       ?? t.rAchieved ?? 0,
+    notes:            t.notes            || '',
+    date:             t.trade_date       || t.date       || '',
+    savedAt:          t.created_at       || t.savedAt    || '',
+    isBacktest:       inp.isBacktest     || t.backtest   || t.isBacktest || false,
+    screenshots,
+    images: screenshots,
+
+    // ── Pipeline snapshot (for checklist render) ───────────────────────
+    pipelineSnapshot: snapshot,
+
+    // ── Granular inp fields (restored from pipeline.inp blob) ──────────
+    poiLocation:      inp.poiLocation    || t.poi        || '',
+    poiSizePips:      inp.poiSizePips    || '',
+    poiType:          inp.poiType        || '',
+    m5Build:          inp.m5Build        || false,
+    m5Ind:            inp.m5Ind          || false,
+    m5Push:           inp.m5Push         || false,
+    liquidityType:    inp.liquidityType  ||
+                      (t.liquidity ? t.liquidity.split(', ').filter(Boolean) : []),
+    multiLayerTrap:   inp.multiLayerTrap || false,
+    trapWho:          inp.trapWho        || '',
+    trapClarity:      inp.trapClarity    || '',
+    dispQuality:      inp.dispQuality    || '',
+    fvgPresent:       inp.fvgPresent     || '',
+    failType:         inp.failType       || '',
+    firstLeg:         inp.firstLeg       || false,
+    secondLeg:        inp.secondLeg      || false,
+    bosStatus:        inp.bosStatus      || '',
+    entryIdea:        inp.entryIdea      || '',
+    ltfConfirm:       inp.ltfConfirm     || '',
+    stopPips:         inp.stopPips       || '',
+    riskPct:          inp.riskPct        || '',
+    estRR:            inp.estRR          || '',
+    rangeLoc:         inp.rangeLoc       || '',
   };
 }
 
@@ -690,6 +724,83 @@ const MTag = ({label,ok}) => (
   </div>
 );
 
+// ─── INFOTIP — ⓘ icon with CSS-only hover tooltip (desktop only) ──────
+const InfoTip = ({ content, position = "right" }) => {
+  if (!content) return null;
+  const posClass = position === "left"
+    ? "right-full mr-2 top-0"
+    : "left-full ml-2 top-0";
+  return (
+    <span className="relative group inline-flex items-center cursor-default ml-1 flex-shrink-0">
+      <span className="text-gray-700 hover:text-gray-400 text-xs leading-none select-none">ⓘ</span>
+      <span className={`pointer-events-none invisible group-hover:visible absolute ${posClass} z-50 w-64 bg-gray-900 border border-gray-700 text-gray-300 text-xs rounded p-2.5 shadow-2xl leading-relaxed whitespace-normal`}>
+        {content}
+      </span>
+    </span>
+  );
+};
+
+// ─── COMPACT MULTI-SELECT — tags field + collapsible dropdown ──────────
+const CompactMultiSel = ({ value = [], onChange, options }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const toggle = (v) => {
+    if (value.includes(v)) onChange(value.filter(x => x !== v));
+    else onChange([...value, v]);
+  };
+
+  const labelMap = Object.fromEntries(options.map(([v, l]) => [v, l]));
+  const selected = value.filter(v => labelMap[v]);
+
+  return (
+    <div className="relative" ref={ref}>
+      {/* Field display */}
+      <div
+        onClick={() => setOpen(o => !o)}
+        className="min-h-[2rem] w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center cursor-pointer hover:border-gray-600"
+      >
+        {selected.length === 0 && (
+          <span className="text-gray-600 text-xs">— Select pools —</span>
+        )}
+        {selected.map(v => (
+          <span key={v} className="inline-flex items-center gap-1 bg-gray-800 border border-gray-700 text-green-400 text-xs rounded px-1.5 py-0.5">
+            {labelMap[v]}
+            <button
+              onClick={e => { e.stopPropagation(); toggle(v); }}
+              className="text-gray-500 hover:text-red-400 leading-none cursor-pointer ml-0.5"
+            >×</button>
+          </span>
+        ))}
+        <span className="ml-auto text-gray-700 text-xs pl-1">{open ? "▲" : "▼"}</span>
+      </div>
+      {/* Dropdown */}
+      {open && (
+        <div className="absolute z-40 w-full mt-1 bg-gray-900 border border-gray-700 rounded shadow-xl max-h-56 overflow-y-auto">
+          {options.map(([v, l]) => (
+            <label key={v} className="flex items-center gap-2 px-2.5 py-1.5 hover:bg-gray-800 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={value.includes(v)}
+                onChange={() => toggle(v)}
+                className="w-3.5 h-3.5 accent-green-500 cursor-pointer flex-shrink-0"
+              />
+              <span className={`text-xs ${value.includes(v) ? "text-green-400" : "text-gray-400"}`}>{l}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ═══════════════════════════════════════════════════════════════════════
 // TAB: EVALUATE (left = inputs, right = pipeline + decision + extras)
 // ═══════════════════════════════════════════════════════════════════════
@@ -750,13 +861,22 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
             <div><FL>Session</FL>
               <Sel value={inp.session} onChange={v=>set("session",v)} placeholder="— Session —"
                 options={[["frankfurt","Frankfurt Open (07:00–08:00 / 08:00–09:00 BST)"],["london","London Open (08:30–10:00 / 08:30–10:00 BST)"],["ny2","NY Second Hour (10:00–11:00 NY / 15:00–16:00 BST)"],["london_lunch","London Lunch (12:30–14:00 / 12:30–14:00 BST)"],["ny1pm","NY After Lunch (13:00–14:00 NY / 18:00–19:00 BST)"],["outside","Outside Valid Window — No Trade"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-yellow-400 font-bold">Frankfurt Open</span> — 07:00–08:00 UK (08:00–09:00 BST). Early liquidity grab. Frankfurt sets a high or low that London frequently sweeps. Good for engineered traps.</div>
-                <div><span className="text-green-400 font-bold">London Open</span> — 08:30–10:00 BST. Highest probability window. The main institutional session. Most inducement and reversal setups happen here. Prime time.</div>
-                <div><span className="text-blue-400 font-bold">NY Second Hour</span> — 15:00–16:00 BST (10:00–11:00 NY). After the NY open noise settles. Second hour often delivers the true directional move. Strong for continuations.</div>
-                <div><span className="text-gray-300 font-bold">London Lunch</span> — 12:30–14:00 BST. Lower liquidity, slower price action. Continuation setups can work here but treat with caution — less institutional involvement.</div>
-                <div><span className="text-orange-400 font-bold">NY After Lunch</span> — 18:00–19:00 BST (13:00–14:00 NY). Post-lunch NY expansion window. Price often resumes the daily direction after the lunch lull. Valid for continuation setups.</div>
-                <div><span className="text-red-500 font-bold">Outside Window</span> — You are not in any valid session. DO NOT TRADE. This is not a discretionary decision — outside these windows the model does not apply.</div>
+              <div className="mt-2 bg-gray-900 border border-gray-800 rounded px-2.5 py-2 space-y-1">
+                {[
+                  { color:"text-yellow-400", name:"Frankfurt Open", time:"07:00–08:00 BST", desc:"Early liquidity grab. Frankfurt sets a high or low that London frequently sweeps. Good for engineered traps." },
+                  { color:"text-green-400",  name:"London Open",    time:"08:30–10:00 BST", desc:"Highest probability window. The main institutional session. Most inducement and reversal setups happen here. Prime time." },
+                  { color:"text-blue-400",   name:"NY Second Hour", time:"15:00–16:00 BST", desc:"After the NY open noise settles. Second hour often delivers the true directional move. Strong for continuations." },
+                  { color:"text-gray-300",   name:"London Lunch",   time:"12:30–14:00 BST", desc:"Lower liquidity, slower price action. Continuation setups can work but treat with caution — less institutional involvement." },
+                  { color:"text-orange-400", name:"NY After Lunch", time:"18:00–19:00 BST", desc:"Post-lunch NY expansion window. Price often resumes the daily direction after the lunch lull. Valid for continuation setups." },
+                  { color:"text-red-500",    name:"Outside Window", time:"No valid session",  desc:"You are not in any valid session. DO NOT TRADE. This is not a discretionary decision — outside these windows the model does not apply." },
+                ].map(s=>(
+                  <div key={s.name} className="flex items-center gap-1 text-xs">
+                    <span className={`font-bold ${s.color} flex-shrink-0`}>{s.name}</span>
+                    <span className="text-gray-700">—</span>
+                    <span className="text-gray-600">{s.time}</span>
+                    <InfoTip content={s.desc} />
+                  </div>
+                ))}
               </div>
             </div>
             <div className="flex items-center justify-between pt-1">
@@ -802,23 +922,27 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
         </Panel>
 
         <Panel>
-          <SH>Liquidity</SH>
-          <FL>Pool Type — select all that apply</FL>
-          <MultiSel value={inp.liquidityType} onChange={v=>set("liquidityType",v)}
-            options={[["eq_high","Equal Highs"],["eq_low","Equal Lows"],["sess_high","Session High"],["sess_low","Session Low"],["hopd","HOPD"],["hopw","HOPW"],["trendline","Trendline Liquidity"],["internal","Internal Liquidity"],["swing_hl","Swing Highs & Lows"],["frankfurt_h","Frankfurt High ✦"],["frankfurt_l","Frankfurt Low ✦"],["london_h","London Open High ✦"],["london_l","London Open Low ✦"],["smc_trap","SMC Trap Zone ✦"],["unclear","Unclear"]]}/>
-          <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-            <div><span className="text-green-400 font-bold">Equal Highs / Lows</span> — Two or more price levels touched at exactly the same point. These attract stops sitting above/below them. Classic engineered liquidity target.</div>
-            <div><span className="text-yellow-500 font-bold">Session High / Low</span> — The highest or lowest price reached in the current session (Frankfurt or London). Price often returns to sweep these before continuing.</div>
-            <div><span className="text-blue-400 font-bold">HOPD</span> — High Of Previous Day. Stops from yesterday's sellers or failed breakout longs sit just above this level.</div>
-            <div><span className="text-blue-400 font-bold">HOPW</span> — High Of Previous Week. A higher-timeframe liquidity target. Marks where weekly traders placed stops.</div>
-            <div><span className="text-purple-400 font-bold">Trendline Liquidity</span> — Stops clustered along a visible trendline that retail traders are leaning on. Price sweeps the line to grab stops before reversing.</div>
-            <div><span className="text-gray-300 font-bold">Internal Liquidity</span> — FVGs, imbalances, or short-term highs/lows within the current range. Not the big external pool — used as a stepping stone or partial target.</div>
-            <div><span className="text-cyan-400 font-bold">Swing Highs & Lows</span> — Clear structural swing points on the chart. Price sweeps the high or low of a prior swing move to grab the stops sitting behind it before reversing.</div>
-            <div><span className="text-orange-400 font-bold">Frankfurt High / Low ✦</span> — The high or low formed during the Frankfurt session (07:00–08:00). Frequently swept by London Open as the first engineered liquidity grab of the day.</div>
-            <div><span className="text-orange-400 font-bold">London Open High / Low ✦</span> — The high or low set in the first 30 mins of London. NY session often returns to sweep this before expanding in the true direction.</div>
-            <div><span className="text-red-400 font-bold">SMC Trap Zone ✦</span> — A weak demand or supply area created by SMC retail traders. These become liquidity pools — price runs them to trap those traders before reversing.</div>
-            <div><span className="text-gray-500 font-bold">Unclear</span> — You can see something is there but cannot identify the type. Use this to flag it and come back — do not force a label.</div>
+          <div className="flex items-center mb-3 border-b border-gray-800 pb-1.5">
+            <span className="text-xs text-gray-600 uppercase tracking-widest">Liquidity</span>
+            <InfoTip position="right" content={
+              <span>
+                <span className="text-green-400 font-bold">Equal Highs/Lows:</span> Stops above/below matched levels — classic engineered target.<br/>
+                <span className="text-yellow-400 font-bold">Session High/Low:</span> Price sweeps Frankfurt or London session extremes before continuing.<br/>
+                <span className="text-blue-400 font-bold">HOPD/HOPW:</span> Stops from previous day/week traders sitting above key levels.<br/>
+                <span className="text-purple-400 font-bold">Trendline:</span> Stops clustered along a retail trendline — price grabs them before reversing.<br/>
+                <span className="text-gray-300 font-bold">Internal:</span> FVGs/imbalances within range — stepping stone or partial target.<br/>
+                <span className="text-cyan-400 font-bold">Swing H&L:</span> Prior swing stops swept before expansion.<br/>
+                <span className="text-orange-400 font-bold">Frankfurt/London High/Low ✦:</span> High-probability session levels frequently swept by the next session.<br/>
+                <span className="text-red-400 font-bold">SMC Trap Zone ✦:</span> Weak retail demand/supply areas — price runs them to trap SMC traders.<br/>
+                <span className="text-gray-500 font-bold">Unclear:</span> Flag and return — do not force a label.
+              </span>
+            }/>
           </div>
+          <div className="mb-1">
+            <FL>Pool Type — select all that apply</FL>
+          </div>
+          <CompactMultiSel value={inp.liquidityType} onChange={v=>set("liquidityType",v)}
+            options={[["eq_high","Equal Highs"],["eq_low","Equal Lows"],["sess_high","Session High"],["sess_low","Session Low"],["hopd","HOPD"],["hopw","HOPW"],["trendline","Trendline Liquidity"],["internal","Internal Liquidity"],["swing_hl","Swing Highs & Lows"],["frankfurt_h","Frankfurt High ✦"],["frankfurt_l","Frankfurt Low ✦"],["london_h","London Open High ✦"],["london_l","London Open Low ✦"],["smc_trap","SMC Trap Zone ✦"],["unclear","Unclear"]]}/>
           {Array.isArray(inp.liquidityType)&&inp.liquidityType.filter(v=>v!=="unclear").length>1&&(
             <div className="mt-1.5 text-xs text-green-500">✦ Multi-layer trap detected — stronger setup</div>
           )}
@@ -832,14 +956,19 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
                 placeholder={isRev?"e.g. Early longs above equal highs trapped — believed breakout was real. Asia buyers and London sellers also lured in...":"e.g. SMC buyers trapped at weak demand — price uses it as liquidity run..."}
                 rows={3} className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700 resize-none"/>
             </div>
-            <div><FL>Trap Clarity</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>Trap Clarity</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-green-400 font-bold">Clear — Confirmed:</span> You can see exactly who got trapped, how, and why. The story is complete and believable. This is the only state where you can proceed.<br/><br/>
+                    <span className="text-yellow-400 font-bold">Forming — Wait:</span> Trap is developing but not yet complete. Wait for full inducement to play out.<br/><br/>
+                    <span className="text-red-400 font-bold">Unclear — Cannot Confirm:</span> Cannot identify who is trapped or why. Do not force a read — NO TRADE.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.trapClarity} onChange={v=>set("trapClarity",v)} placeholder="— Assess Trap —"
                 options={[["clear","Clear — Confirmed"],["forming","Forming — Wait"],["unclear","Unclear — Cannot Confirm"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-green-400 font-bold">Clear — Confirmed</span> — You can see exactly who got trapped, how, and why. The story is believable and complete. You could explain it to someone else in plain words right now. This is the only state where you can proceed.</div>
-                <div><span className="text-yellow-500 font-bold">Forming — Wait</span> — You can see a trap is developing but it is not complete yet. The move is still in progress. Do not jump in — wait for the full inducement to play out before assessing again.</div>
-                <div><span className="text-red-400 font-bold">Unclear — Cannot Confirm</span> — You cannot clearly identify who is trapped or why. If you cannot explain the trap, there is no trade here. Mark this and do not force a read — NO TRADE.</div>
-              </div>
             </div>
             <Chk checked={inp.multiLayerTrap} onChange={v=>set("multiLayerTrap",v)} label="Multi-layer trap — multiple participant groups ✦"/>
           </div>
@@ -848,24 +977,34 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
         <Panel>
           <SH>Displacement</SH>
           <div className="space-y-2.5">
-            <div><FL>Quality</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>Quality</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-green-400 font-bold">Strong + Impulsive:</span> Fast, decisive, one-directional. Multiple large candles, no hesitation. Required for a valid setup.<br/><br/>
+                    <span className="text-yellow-400 font-bold">Moderate:</span> Some direction but not convincing. Needs FVG confirmation before proceeding.<br/><br/>
+                    <span className="text-red-400 font-bold">Weak / Drift:</span> No momentum, overlapping candles. No institutional footprint — NO TRADE.<br/><br/>
+                    <span className="text-gray-400 font-bold">Unclear:</span> Wait for the move to develop further.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.dispQuality} onChange={v=>set("dispQuality",v)} placeholder="— Assess Impulse —"
                 options={[["strong","Strong + Impulsive"],["moderate","Moderate"],["weak","Weak / Drift"],["unclear","Unclear"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-green-400 font-bold">Strong + Impulsive</span> — The move is fast, decisive, and one-directional. Multiple large candles in the same direction with no hesitation. This is what institutional intent looks like. Required for a valid setup.</div>
-                <div><span className="text-yellow-500 font-bold">Moderate</span> — Some directional movement but not convincing. A mix of larger and smaller candles, or a move that stalled mid-way. Needs FVG confirmation before proceeding.</div>
-                <div><span className="text-red-400 font-bold">Weak / Drift</span> — Price is drifting or grinding in a direction with no real momentum. Small overlapping candles. No institutional footprint visible. This is NOT displacement — NO TRADE.</div>
-                <div><span className="text-gray-400 font-bold">Unclear</span> — You cannot tell if the move is impulsive or not yet. Wait for the move to develop further before making a call.</div>
-              </div>
             </div>
-            <div><FL>FVG / Imbalance?</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>FVG / Imbalance?</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-green-400 font-bold">Yes — Confirmed:</span> A Fair Value Gap is clearly visible — 3-candle pattern leaving a gap between candle 1's wick and candle 3's wick. Confirms institutional intent.<br/><br/>
+                    <span className="text-red-400 font-bold">No — Not Present:</span> Candles fully overlapping. Displacement lacks structural evidence — NO TRADE.<br/><br/>
+                    <span className="text-gray-400 font-bold">Unclear:</span> Zoom in and look for the three-candle gap. If still unsure, wait.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.fvgPresent} onChange={v=>set("fvgPresent",v)} placeholder="— FVG Status —"
                 options={[["yes","Yes — Confirmed"],["no","No — Not Present"],["unclear","Unclear"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-green-400 font-bold">Yes — Confirmed</span> — A Fair Value Gap (FVG) is clearly visible in the displacement move. This is a 3-candle pattern where the middle candle moves so fast it leaves a gap between candle 1's wick and candle 3's wick. Confirms institutional intent.</div>
-                <div><span className="text-red-400 font-bold">No — Not Present</span> — The move did not leave any imbalance or gap. Candles are fully overlapping. Without an FVG, the displacement lacks structural evidence. NO TRADE.</div>
-                <div><span className="text-gray-400 font-bold">Unclear</span> — You can see something but are not sure if it qualifies. Zoom in on your chart and look for the three-candle gap. If still unsure, wait — do not force it.</div>
-              </div>
             </div>
           </div>
         </Panel>
@@ -873,28 +1012,38 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
         <Panel>
           <SH>Failure Model + BOS</SH>
           <div className="space-y-2.5">
-            <div><FL>Failure Type</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>Failure Type</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-red-400 font-bold">No HH:</span> Price pushed up, retraced, failed to make a new higher high. Bearish failure — used for shorts.<br/><br/>
+                    <span className="text-green-400 font-bold">No LL:</span> Price pushed down, retraced, failed to make a new lower low. Bullish failure — used for longs.<br/><br/>
+                    <span className="text-yellow-400 font-bold">Forming:</span> Move developing. Wait for retracement to complete and failure to confirm.<br/><br/>
+                    <span className="text-gray-400 font-bold">Neither:</span> Price still in impulse. No failure yet — wait for the model to develop.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.failType} onChange={v=>set("failType",v)} placeholder="— Failure Status —"
                 options={[["no_hh","No Higher High — Bearish failure"],["no_ll","No Lower Low — Bullish failure"],["unclear","Forming / Unclear"],["neither","Neither — No failure"]]}/>
-            </div>
-            <div className="bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-              <div><span className="text-red-400 font-bold">No HH</span> — Price pushed up, retraced, then failed to make a new higher high. Bearish. Used for shorts.</div>
-              <div><span className="text-green-400 font-bold">No LL</span> — Price pushed down, retraced, then failed to make a new lower low. Bullish. Used for longs.</div>
-              <div><span className="text-yellow-600 font-bold">Forming</span> — The move is developing. First leg may be in. Wait for the retracement to complete and the failure to confirm.</div>
-              <div><span className="text-gray-400 font-bold">Neither</span> — Price is still in a strong impulse. No failure yet. Do not enter — wait for the model to develop.</div>
             </div>
             <div className="space-y-1">
               <Chk checked={inp.firstLeg}  onChange={v=>set("firstLeg",v)}  label="First leg confirmed"/>
               {isRev&&<Chk checked={inp.secondLeg} onChange={v=>set("secondLeg",v)} label="Second leg confirmed ✦"/>}
             </div>
-            <div><FL>BOS / CHoCH</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>BOS / CHoCH</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-green-400 font-bold">Confirmed:</span> Price has broken a key structure level in your trade direction. Structure has shifted — you can now look for the RIFC entry.<br/><br/>
+                    <span className="text-yellow-400 font-bold">Not Yet — Forming:</span> Failure confirmed but structure not broken yet. Stay patient.<br/><br/>
+                    <span className="text-red-400 font-bold">No — Not Present:</span> No structural break confirmed. Without BOS there is no directional confirmation — NO TRADE.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.bosStatus} onChange={v=>set("bosStatus",v)} placeholder="— BOS Status —"
                 options={[["yes","Confirmed"],["wait","Not Yet — Forming"],["no","No — Not Present"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-green-400 font-bold">Confirmed</span> — Price has broken a key structure level (swing high or low) in the direction of your trade. For longs: a previous swing high has been taken out to the upside. For shorts: a previous swing low has been broken to the downside. Structure has shifted. You can now look for the RIFC entry.</div>
-                <div><span className="text-yellow-500 font-bold">Not Yet — Forming</span> — The failure model is confirmed but price has not yet broken structure. You are waiting. Stay patient — do not enter before this step is done.</div>
-                <div><span className="text-red-400 font-bold">No — Not Present</span> — Price attempted to break structure but failed, or no clear structural break has happened at all. Without a BOS, there is no confirmation of direction. NO TRADE.</div>
-              </div>
             </div>
           </div>
         </Panel>
@@ -908,16 +1057,20 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
                 options={[["yes","Yes — At Origin"],["no","No — Mid/Late Move"],["unclear","Unclear"]]}/>
             </div>
             {isCont&&<Chk checked={inp.demandBelow50} onChange={v=>set("demandBelow50",v)} label="Demand/Supply beyond 50% of push ✦ (required for continuation)"/>}
-            <div><FL>LTF Confirmation</FL>
+            <div>
+              <div className="flex items-center mb-1">
+                <FL>LTF Confirmation</FL>
+                <InfoTip content={
+                  <span>
+                    <span className="text-green-400 font-bold">Engulf Candle ✦:</span> Single candle fully engulfs the previous candle body at or near the RIFC zone. "Just this candle alone is confirmation." Your entry trigger.<br/><br/>
+                    <span className="text-green-400 font-bold">M1 CHoCH ✦:</span> Change of Character on M1 at the RIFC zone — micro-structure has shifted in your favour.<br/><br/>
+                    <span className="text-green-300 font-bold">Both ✦✦:</span> Highest conviction — engulf candle AND M1 CHoCH aligning at RIFC simultaneously. A+ signal.<br/><br/>
+                    <span className="text-gray-400 font-bold">Unclear / Not Yet:</span> At the zone but trigger has not fired. Wait — touching the zone is not confirmation.
+                  </span>
+                }/>
+              </div>
               <Sel value={inp.ltfConfirm} onChange={v=>set("ltfConfirm",v)} placeholder="— LTF Confirm —"
                 options={[["engulf_candle","Engulf Candle at RIFC ✦"],["m1_choch","M1 CHoCH ✦"],["both","Both — Engulf + M1 CHoCH ✦✦"],["unclear","Unclear / Not Yet"]]}/>
-              <div className="mt-2 bg-gray-900 border border-gray-800 rounded p-2.5 space-y-1.5 text-xs text-gray-500">
-                <div><span className="text-green-400 font-bold">Engulf Candle at RIFC ✦</span> — A single candle that fully engulfs the body of the previous candle in your trade direction, forming at or near the RIFC zone. "Just this candle alone is confirmation." This is your entry trigger. The candle is showing you who is in control right now.</div>
-                <div><span className="text-green-400 font-bold">M1 CHoCH ✦</span> — A Change of Character on the M1 chart. Price made a lower low (for shorts) or higher high (for longs) on M1 at the RIFC zone, then breaks the most recent M1 swing in the opposite direction. Confirms the micro-structure has shifted in your favour.</div>
-                <div><span className="text-green-300 font-bold">Both — Engulf + M1 CHoCH ✦✦</span> — The highest conviction entry signal. You have both the engulf candle AND the M1 CHoCH lining up at the RIFC zone simultaneously. This is the cleanest entry available. Treat this as your A+ signal.</div>
-                <div><span className="text-gray-400 font-bold">Unclear / Not Yet</span> — You are at the zone but the entry trigger has not fired yet. Wait — do not enter before confirmation. The RIFC zone being touched is not the trigger. The candle or M1 shift is.</div>
-              </div>
-              <div className="text-xs text-gray-700 mt-1">"Just this candle alone is confirmation."</div>
             </div>
             <div className="grid grid-cols-3 gap-1.5">
               <div><FL>Stop</FL><Inp type="number" value={inp.stopPips} onChange={v=>set("stopPips",v)} placeholder="1.5–5p"/></div>
@@ -950,17 +1103,15 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
         {/* Pipeline */}
         <Panel>
           <SH>Evaluation Pipeline — POI → TIME → LIQ → INDUCE → DISP → FAIL → BOS → RIFC</SH>
-          <div className="space-y-1.5">
+          <div className="space-y-1">
             {PIPELINE.map(step=>{
               const res=ev.results[step]; const s=res?.s||S.PENDING;
               return (
-                <div key={step} className={`flex items-start gap-2.5 px-3 py-2 rounded border ${s===S.PASS?"border-green-900 bg-green-950/20":s===S.FORMING?"border-yellow-900 bg-yellow-950/10":s===S.FAIL?"border-red-900 bg-red-950/15":"border-gray-800/50"}`}>
-                  <div className="flex-shrink-0 w-5 pt-px"><SB s={s}/></div>
-                  <div className="flex-1 min-w-0">
-                    <div className={`font-bold uppercase tracking-wider text-xs ${s===S.PASS?"text-green-400":s===S.FORMING?"text-yellow-400":s===S.FAIL?"text-red-400":"text-gray-700"}`}>
-                      {step} <span className="font-normal text-gray-600 normal-case tracking-normal">— {STEP_NAME[step]}</span>
-                    </div>
-                    {res?.r&&<div className={`mt-0.5 text-xs leading-relaxed ${s===S.PASS?"text-green-700":s===S.FORMING?"text-yellow-700":s===S.FAIL?"text-red-500":"text-gray-700"}`}>{res.r}</div>}
+                <div key={step} className={`flex items-center gap-2.5 px-3 py-1.5 rounded border ${s===S.PASS?"border-green-900 bg-green-950/20":s===S.FORMING?"border-yellow-900 bg-yellow-950/10":s===S.FAIL?"border-red-900 bg-red-950/15":"border-gray-800/50"}`}>
+                  <div className="flex-shrink-0 w-5"><SB s={s}/></div>
+                  <div className={`font-bold uppercase tracking-wider text-xs flex items-center ${s===S.PASS?"text-green-400":s===S.FORMING?"text-yellow-400":s===S.FAIL?"text-red-400":"text-gray-700"}`}>
+                    {step} <span className="font-normal text-gray-600 normal-case tracking-normal ml-1">— {STEP_NAME[step]}</span>
+                    {res?.r && <InfoTip content={res.r} />}
                   </div>
                 </div>
               );
@@ -1895,11 +2046,12 @@ function LiveModeTab({ onSaveToJournal }) {
                     "Previous day high/low taken":      "hopd",
                   };
                   const sessKey =
-                    sessionInfo.name.includes("Frankfurt")     ? "frankfurt"    :
-                    sessionInfo.name.includes("London Open")   ? "london"       :
-                    sessionInfo.name.includes("NY After Lunch")? "ny1pm"        :
-                    sessionInfo.name.includes("NY 2nd Hour")   ? "ny2"          :
-                    sessionInfo.name.includes("Lunch")         ? "london_lunch" : "";
+                    sessionInfo.name.includes("Frankfurt")    ? "frankfurt"    :
+                    sessionInfo.name.includes("London Open")  ? "london"       :
+                    sessionInfo.name.includes("NY 1PM")       ? "ny1pm"        :
+                    sessionInfo.name.includes("NY 2nd Hour")  ? "ny2"          :
+                    sessionInfo.name.includes("NY PM")        ? "ny1pm"        :
+                    sessionInfo.name.includes("Lunch")        ? "london_lunch" : "";
                   const liqKeys = liqChecked.map(i=>liqDisplayToKey[i]).filter(Boolean);
                   const liqLabel = liqChecked.slice(0,2).join(" + ")+(liqChecked.length>2?` +${liqChecked.length-2} more`:"");
                   onSaveToJournal({
@@ -2153,14 +2305,22 @@ function JournalTab({ journal, setJournal, journalLoading, journalError, livePre
 
               {/* Sub-header */}
               <div className="mt-1 text-xs text-gray-600">
-                {t.pair} | {t.trapClarity} trap | {t.ltfConfirm||"no LTF confirm"} | {new Date(t.savedAt).toLocaleDateString()}
+                {t.pair}
+                {t.htfBias ? ` | ${t.htfBias}` : ''}
+                {t.direction ? ` ${t.direction}` : ''}
+                {t.trapClarity ? ` | ${t.trapClarity} trap` : ''}
+                {' | '}{t.date
+                  ? new Date(t.date + 'T00:00:00').toLocaleDateString()
+                  : t.savedAt
+                    ? new Date(t.savedAt).toLocaleDateString()
+                    : '—'}
               </div>
 
               {/* Notes */}
               {t.notes&&<div className="mt-1.5 text-xs text-gray-500 italic">"{t.notes}"</div>}
 
               {/* Pipeline Snapshot + Full Trade Details */}
-              {t.pipelineSnapshot&&(
+              {t.pipelineSnapshot&&Object.keys(t.pipelineSnapshot).length>0&&(
                 <div className="mt-2 space-y-1.5">
                   {/* Pipeline expand */}
                   <button onClick={()=>toggleExpand(t.id+"_pipe")}
@@ -2216,7 +2376,14 @@ function JournalTab({ journal, setJournal, journalLoading, journalError, livePre
                       {/* Liquidity */}
                       <div className="border-b border-gray-800/60 pb-2">
                         <div className="text-gray-500 uppercase tracking-widest mb-1.5">Liquidity</div>
-                        <div className="text-gray-400">{Array.isArray(t.liquidityType)&&t.liquidityType.length>0?t.liquidityType.join(", "):"—"}</div>
+                        <div className="text-gray-400">{Array.isArray(t.liquidityType)&&t.liquidityType.length>0?t.liquidityType.map(k=>({
+                          eq_high:'Equal Highs', eq_low:'Equal Lows',
+                          sess_high:'Session High', sess_low:'Session Low',
+                          hopd:'Prev Day High', lopd:'Prev Day Low',
+                          frankfurt_h:'Frankfurt High', frankfurt_l:'Frankfurt Low',
+                          swing_hl:'Swing Highs and Lows', trendline:'Trendline Liquidity',
+                          internal:'Internal Liquidity', smc_trap:'SMC Trap Zone',
+                        }[k]||k)).join(", "):"—"}</div>
                         {t.multiLayerTrap&&<div className="text-green-700 mt-0.5">✦ Multi-layer trap</div>}
                       </div>
                       {/* Trap Story */}
@@ -2295,6 +2462,23 @@ function AnalyticsTab({ journal }) {
   const stats = useMemo(()=>computeStats(journal),[journal]);
   const weaknesses = useMemo(()=>detectWeaknesses(stats),[stats]);
 
+  const [evalCount, setEvalCount] = useState(null);
+  const [failData,  setFailData]  = useState([]);
+
+  useEffect(()=>{
+    supabase.from('evaluations').select('*', { count:'exact', head:true })
+      .then(({ count }) => setEvalCount(count ?? 0));
+    supabase.from('evaluations').select('failed_at').eq('evaluation_result','NO TRADE')
+      .then(({ data }) => {
+        if (!data) return;
+        const tally = {};
+        data.forEach(r => { if (r.failed_at) tally[r.failed_at] = (tally[r.failed_at]||0)+1; });
+        const ORDER  = ['POI','TIME','LIQ','INDUCE','DISP','FAIL','BOS','RIFC'];
+        const LABELS = { POI:'POI', TIME:'Time', LIQ:'Liquidity', INDUCE:'Inducement', DISP:'Displacement', FAIL:'Failure', BOS:'BOS/CHoCH', RIFC:'Entry' };
+        setFailData(ORDER.filter(s=>tally[s]!=null).map(s=>({ step:LABELS[s]||s, count:tally[s] })));
+      });
+  }, []);
+
   const total = journal.length;
   const wins  = journal.filter(t=>t.outcome==="win").length;
   const losses= journal.filter(t=>t.outcome==="loss").length;
@@ -2358,6 +2542,21 @@ function AnalyticsTab({ journal }) {
           ))}
         </div>
 
+        {evalCount!==null&&(
+          <div className="mb-4 flex items-center gap-3 flex-wrap text-xs border border-gray-800 rounded px-3 py-2.5">
+            <span className="text-gray-500 uppercase tracking-wider">Evaluations</span>
+            <span className="text-gray-200 font-bold">{evalCount}</span>
+            <span className="text-gray-700">·</span>
+            <span className="text-gray-500 uppercase tracking-wider">Trades Taken</span>
+            <span className="text-gray-200 font-bold">{total}</span>
+            <span className="text-gray-700">·</span>
+            <span className="text-gray-500 uppercase tracking-wider">Conversion</span>
+            <span className={`font-bold ${evalCount>0&&Math.round(total/evalCount*100)>=25?"text-green-400":"text-yellow-500"}`}>
+              {evalCount>0?`${Math.round(total/evalCount*100)}%`:"—"}
+            </span>
+          </div>
+        )}
+
         {weaknesses.length>0&&(
           <div className="mb-4 border border-red-900 bg-red-950/10 rounded p-3">
             <div className="text-xs text-red-500 font-bold uppercase tracking-wider mb-2">Personal Weaknesses (auto-detected)</div>
@@ -2379,6 +2578,33 @@ function AnalyticsTab({ journal }) {
           🟢 Strong (≥3 trades, {">"}75% WR) &nbsp;|&nbsp; 🔴 Weak (≥3 trades, {"<"}45% WR) &nbsp;|&nbsp; Adaptive grading adjusts based on these stats.
         </div>
       </Panel>
+
+      {failData.length>0&&(
+        <Panel>
+          <SH>Pipeline Failure Frequency</SH>
+          <div className="text-xs text-gray-600 mb-3">Steps where evaluations ended as NO TRADE</div>
+          {(()=>{
+            const maxC = Math.max(...failData.map(d=>d.count));
+            return (
+              <div className="space-y-2">
+                {failData.map(d=>(
+                  <div key={d.step} className="flex items-center gap-3 text-xs">
+                    <div className="w-24 text-right text-gray-500 shrink-0">{d.step}</div>
+                    <div className="flex-1 bg-gray-900 rounded overflow-hidden h-6 border border-gray-800">
+                      <div
+                        className="h-full bg-red-900/60 flex items-center justify-end pr-2 rounded"
+                        style={{width:`${Math.round(d.count/maxC*100)}%`, minWidth:'2rem'}}
+                      >
+                        <span className="text-red-400 font-bold">{d.count}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+        </Panel>
+      )}
     </div>
   );
 }
@@ -2476,26 +2702,104 @@ export default function WTA1() {
       ? trade.screenshots
       : (Array.isArray(trade.images) ? trade.images : []);
     const compressed = await Promise.all(rawScreenshots.map(s => compressImage(s)));
+
+    // Derive direction from htfBias if not explicitly set
+    const direction = trade.direction ||
+      (trade.htfBias === 'bearish' ? 'SHORT' :
+       trade.htfBias === 'bullish' ? 'LONG' : '');
+
+    // Robust trade_date: use backtestDate for backtests, else today
+    const tradeDate = (() => {
+      if (trade.isBacktest && trade.backtestDate) {
+        const d = new Date(trade.backtestDate);
+        if (!isNaN(d)) return d.toISOString().split('T')[0];
+      }
+      return new Date().toISOString().split('T')[0];
+    })();
+
+    // Store all granular inp fields alongside the pipeline snapshot
+    // so they can be restored when loading from Supabase
+    const pipelineBlob = JSON.stringify({
+      snapshot: trade.pipelineSnapshot || {},
+      inp: {
+        poiLocation:    trade.poiLocation    || '',
+        poiSizePips:    trade.poiSizePips    || '',
+        poiType:        trade.poiType        || '',
+        m5Build:        trade.m5Build        || false,
+        m5Ind:          trade.m5Ind          || false,
+        m5Push:         trade.m5Push         || false,
+        liquidityType:  Array.isArray(trade.liquidityType) ? trade.liquidityType : [],
+        multiLayerTrap: trade.multiLayerTrap || false,
+        trapWho:        trade.trapWho        || '',
+        trapClarity:    trade.trapClarity    || '',
+        dispQuality:    trade.dispQuality    || '',
+        fvgPresent:     trade.fvgPresent     || '',
+        failType:       trade.failType       || '',
+        firstLeg:       trade.firstLeg       || false,
+        secondLeg:      trade.secondLeg      || false,
+        bosStatus:      trade.bosStatus      || '',
+        entryIdea:      trade.entryIdea      || '',
+        ltfConfirm:     trade.ltfConfirm     || '',
+        stopPips:       trade.stopPips       || '',
+        riskPct:        trade.riskPct        || '',
+        estRR:          trade.estRR          || '',
+        rangeLoc:       trade.rangeLoc       || '',
+        htfBias:        trade.htfBias        || '',
+        isBacktest:     trade.isBacktest     || false,
+      },
+    });
+
     const payload = {
       pair:        trade.pair        || '',
-      setup:       trade.setupType   || trade.setup  || '',
-      session:     trade.session     || '',
-      htf_bias:    trade.htfBias     || '',
-      direction:   trade.direction   || '',
-      poi:         trade.poiLocation || trade.poi     || '',
-      liquidity:   Array.isArray(trade.liquidityType)
-                     ? trade.liquidityType.join(', ')
-                     : (trade.liquidity || ''),
-      model:       trade.model       || '',
+      setup:       (() => {
+        const raw = trade.setupType || trade.setup || '';
+        return { reversal_bull:'Bullish Reversal', reversal_bear:'Bearish Reversal',
+                 cont_bull:'Bullish Continuation', cont_bear:'Bearish Continuation' }[raw] || raw;
+      })(),
+      session:     (() => {
+        const raw = trade.session || '';
+        return { london:'London', frankfurt:'Frankfurt', ny1pm:'NY 1PM', ny2:'NY 2nd Hour',
+                 ny2pm:'NY 2nd Hour', asia:'Asia', london_lunch:'London Lunch',
+                 ny_lunch:'NY After Lunch', outside:'Outside Window' }[raw] || raw;
+      })(),
+      htf_bias:    (() => {
+        const raw = trade.htfBias || '';
+        return { bullish:'Bullish', bearish:'Bearish' }[raw] || raw;
+      })(),
+      direction,
+      poi:         trade.poiLocation || trade.poi    || '',
+      liquidity:   (() => {
+        const liqLabels = {
+          eq_high:    'Equal Highs',        eq_low:     'Equal Lows',
+          sess_high:  'Session High',       sess_low:   'Session Low',
+          hopd:       'HOPD',               hopw:       'HOPW',
+          trendline:  'Trendline Liquidity',
+          internal:   'Internal Liquidity',
+          frankfurt_h:'Frankfurt High ✦',   frankfurt_l:'Frankfurt Low ✦',
+          london_h:   'London Open High ✦', london_l:   'London Open Low ✦',
+          smc_trap:   'SMC Trap Zone ✦',    swing_hl:   'Swing Highs & Lows',
+        };
+        if (Array.isArray(trade.liquidityType) && trade.liquidityType.length > 0)
+          return trade.liquidityType.map(k => liqLabels[k] || k).join(', ');
+        return trade.liquidity || '';
+      })(),
+      model:       (() => {
+        const raw = trade.model || trade.setupType || trade.selectedModel || trade.setup || '';
+        const modelLabels = {
+          reversal_bull: 'Bullish Reversal',
+          reversal_bear: 'Bearish Reversal',
+          cont_bull:     'Bullish Continuation',
+          cont_bear:     'Bearish Continuation',
+        };
+        return modelLabels[raw] || raw;
+      })(),
       grade:       trade.grade       || '',
       outcome:     trade.outcome     || '',
       r_achieved:  parseFloat(trade.rAchieved) || 0,
       notes:       trade.notes       || '',
-      pipeline:    trade.pipelineSnapshot ? JSON.stringify(trade.pipelineSnapshot) : '',
+      pipeline:    pipelineBlob,
       screenshots: compressed,
-      trade_date:  trade.savedAt
-                     ? trade.savedAt.split('T')[0]
-                     : new Date().toISOString().split('T')[0],
+      trade_date:  tradeDate,
     };
     const { data, error } = await supabase
       .from('trades')
