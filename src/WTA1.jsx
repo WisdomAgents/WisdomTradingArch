@@ -305,42 +305,6 @@ function runPipeline(inp, journal) {
            tradeAllowed:decision==="VALID_TRADE" };
 }
 
-// ─── EVALUATION RECORDER ──────────────────────────────────────────────
-// Inserts a row into the evaluations table whenever the pipeline reaches
-// a definitive VALID or NO TRADE outcome.
-const SESSION_LABELS = {
-  london:'London', frankfurt:'Frankfurt', ny1pm:'NY 1PM',
-  ny2:'NY 2nd Hour', ny2pm:'NY 2nd Hour', london_lunch:'London Lunch',
-  outside:'Outside Window',
-};
-
-async function insertEvaluation(inp, ev, evaluationResult) {
-  const direction   = inp.htfBias==='bearish' ? 'Short' : inp.htfBias==='bullish' ? 'Long' : '';
-  const session     = SESSION_LABELS[inp.session] || inp.session || '';
-  const pipelineSnapshot = Object.fromEntries(
-    Object.entries(ev.results || {}).map(([k, v]) => ([k, { s: v.s, r: v.r }]))
-  );
-  let failedAt      = null;
-  let failureReason = null;
-  if (evaluationResult === 'NO TRADE') {
-    const fs  = PIPELINE.find(s => ev.results[s]?.s === S.FAIL);
-    failedAt      = fs ? STEP_NAME[fs] : null;
-    failureReason = ev.decReason || null;
-  }
-  const tradeDate = new Date().toISOString().split('T')[0];
-  const { error } = await supabase.from('evaluations').insert([{
-    pair:              inp.pair || '',
-    session,
-    direction,
-    evaluation_result: evaluationResult,
-    failed_at:         failedAt,
-    failure_reason:    failureReason,
-    pipeline_snapshot: pipelineSnapshot,
-    trade_date:        tradeDate,
-  }]);
-  if (error) console.error('Evaluation insert failed:', error.message);
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // ANALYTICS ENGINE
 // ═══════════════════════════════════════════════════════════════════════
@@ -847,6 +811,29 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
   const [showSave, setShowSave] = useState(false);
   const [saveForm, setSaveForm] = useState({ outcome:"win", rAchieved:"", notes:"", images:[] });
   const [lightbox, setLightbox] = useState(null);
+  const [evalLogging, setEvalLogging] = useState(false);
+  const [evalLogged,  setEvalLogged]  = useState(false);
+
+  const insertEvaluation = async () => {
+    setEvalLogging(true);
+    setEvalLogged(false);
+    const failedStep = Object.keys(S).includes("FAIL")
+      ? ["POI","TIME","LIQ","INDUCE","DISP","FAIL","BOS","RIFC"].find(s => ev.results[s]?.s === S.FAIL)
+      : null;
+    const { error } = await supabase.from("evaluations").insert({
+      evaluation_result: "NO TRADE",
+      failed_at:         failedStep || null,
+      pair:              inp.pair        || null,
+      setup_type:        inp.setupType   || null,
+      session:           inp.session     || null,
+      htf_bias:          inp.htfBias     || null,
+      grade:             ev.grade        || null,
+      reason:            ev.decReason    || null,
+      evaluated_at:      new Date().toISOString(),
+    });
+    setEvalLogging(false);
+    if (!error) setEvalLogged(true);
+  };
 
   const handleImageUpload = (e) => {
     const files = Array.from(e.target.files).slice(0,2);
@@ -1186,19 +1173,32 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
               </div>
             )}
           </div>
-          {/* Save to journal button */}
-          <button onClick={()=>setShowSave(true)}
-            className="mt-3 w-full bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-400 py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer">
-            + Save to Trade Journal
-          </button>
-          {/* Log No Trade Evaluation — only shown when the pipeline resolves NO TRADE */}
-          {ev.decision==='NO_TRADE'&&(
-            <button onClick={async ()=>{
-              await insertEvaluation(inp, ev, 'NO TRADE');
-              alert('No trade evaluation logged.');
-            }} className="mt-2 w-full bg-red-950/30 hover:bg-red-950/50 border border-red-900 text-red-500 py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer">
-              Log No Trade Evaluation
+          {/* Buttons — conditional on decision */}
+          {ev.decision === "VALID_TRADE" && (
+            <button onClick={()=>setShowSave(true)}
+              className="mt-3 w-full bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-400 py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer">
+              + Save to Trade Journal
             </button>
+          )}
+          {ev.decision === "NO_TRADE" && (
+            <div className="mt-3 space-y-1.5">
+              {!evalLogged ? (
+                <button
+                  onClick={insertEvaluation}
+                  disabled={evalLogging}
+                  className={`w-full border py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer transition-colors ${
+                    evalLogging
+                      ? "bg-gray-900 border-gray-800 text-gray-600 cursor-not-allowed"
+                      : "bg-red-950/20 hover:bg-red-950/40 border-red-900 text-red-400"
+                  }`}>
+                  {evalLogging ? "Logging…" : "📋 Log No Trade Evaluation"}
+                </button>
+              ) : (
+                <div className="w-full border border-green-900 bg-green-950/20 text-green-500 py-1.5 rounded text-xs text-center uppercase tracking-wider">
+                  ✓ Evaluation logged
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -1237,11 +1237,9 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
                 )}
               </div>
               <div className="flex gap-2">
-                <button onClick={async ()=>{
+                <button onClick={()=>{
                   const savedAt=inp.backtestMode&&inp.backtestDate?new Date(inp.backtestDate).toISOString():new Date().toISOString();
                   const pipelineSnapshot=Object.fromEntries(Object.entries(ev.results||{}).map(([k,v])=>([k,{s:v.s,r:v.r}])));
-                  // Record VALID evaluation before saving the trade
-                  if (ev.decision==='VALID_TRADE') await insertEvaluation(inp, ev, 'VALID');
                   addTrade({...inp,outcome:saveForm.outcome,rAchieved:parseFloat(saveForm.rAchieved)||0,notes:saveForm.notes,grade:ev.grade,savedAt,isBacktest:inp.backtestMode,images:saveForm.images,pipelineSnapshot});
                   setShowSave(false); setSaveForm({outcome:"win",rAchieved:"",notes:"",images:[]});
                 }} className="flex-1 bg-green-950 hover:bg-green-900 border border-green-800 text-green-400 py-1.5 rounded text-xs cursor-pointer">Save Trade</button>
@@ -2707,6 +2705,540 @@ function DisciplinePanel({ disc, setDisc, tradeLog, setTradeLog }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// SQS ENGINE + BACKTEST LOG TAB  (Phase 0A.1)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── Tier / Quality rank maps (used for gate logic) ───────────────────
+const BL_TIER_RANK = { 'Tier 1': 3, 'Tier 2': 2, 'Tier 3': 1 };
+const BL_DISP_RANK = { 'Strong': 3, 'Moderate': 2, 'Weak': 1 };
+
+// ─── SQS Calculation ──────────────────────────────────────────────────
+function calculateSQS(e) {
+  let s = 0;
+  // Base weights
+  s += ({ 'Tier 1': 28, 'Tier 2': 20, 'Tier 3': 10 }[e.liquidity_tier] || 0);
+  s += ({ 'Strong': 25, 'Moderate': 14, 'Weak': 6   }[e.displacement_quality] || 0);
+  s += ({ 'Clean': 10, 'Induced': 7, 'Partial': 3   }[e.sweep_quality] || 0);
+  s += ({ 'CHoCH': 10, 'BOS': 7, 'Unconfirmed': 0   }[e.structure_confirmation] || 0);
+  const indW = { 'Structural': 10, 'EQH/EQL Buildup': 9, 'Trendline Tap': 8, 'Stop Hunt': 8, 'Session Open': 7 };
+  const indArr = Array.isArray(e.inducement_type) ? e.inducement_type : [];
+  if (indArr.length) s += Math.max(...indArr.map(t => indW[t] || 0));
+  s += e.bias_aligned ? 8 : 0;
+  s += ({ 'M1 CHoCH': 7, 'M1 BOS': 6, 'Engulf': 4, 'None': 0 }[e.ltf_confirmation] || 0);
+  s += e.full_sequence_complete ? 7 : 0;
+  // Bonuses
+  if (e.sequence_type === 'Double Sweep'   && e.secondary_displacement_quality === 'Strong' && !e.second_sweep_override) s += 5;
+  if (e.sequence_type === 'Complex Pullback' && e.secondary_displacement_quality === 'Strong' && !e.second_sweep_override) s += 5;
+  if (e.sequence_type === 'Multi-Stage Engineered Reversal' && indArr.length >= 2 && e.ltf_confirmation && e.ltf_confirmation !== 'None') s += 3;
+  // Penalty
+  if (e.second_sweep_override) s -= 8;
+  return Math.min(100, Math.max(0, s));
+}
+
+function sqsBand(score) {
+  if (score >= 85) return { grade:'A+', label:'All major confluence. Take it.',             color:'text-green-300',  ring:'border-green-700'  };
+  if (score >= 70) return { grade:'A',  label:'Strong confluence. Valid entry.',             color:'text-green-500',  ring:'border-green-800'  };
+  if (score >= 55) return { grade:'B',  label:'Incomplete confluence. Reduced size or skip.',color:'text-yellow-400', ring:'border-yellow-700' };
+  if (score >= 40) return { grade:'C',  label:'Significant gaps. Log as NO TRADE.',          color:'text-orange-400', ring:'border-orange-700' };
+  return               { grade:'F',  label:'Auto NO TRADE.',                                color:'text-red-500',    ring:'border-red-700'    };
+}
+
+// ─── Blank entry template ─────────────────────────────────────────────
+const BL_EMPTY = {
+  date: new Date().toISOString().split('T')[0],
+  pair: 'EURUSD', direction: '', session: '', htf_bias: '', bias_aligned: null,
+  model_type: [], model_status: '', sequence_type: '',
+  liquidity_tier: '', liquidity_type: [], sweep_quality: '', sweep_distance_pips: '',
+  failed_continuation: null, secondary_liquidity_tier: '', secondary_liquidity_type: [],
+  secondary_sweep_quality: '', secondary_displacement_quality: '', second_sweep_override: false,
+  displacement_confirmed: null, displacement_quality: '', displacement_body_ratio: '',
+  candle_close_position: '', choch_or_bos: '', structure_confirmation: '',
+  poi_type: '', poi_size_pips: '', inducement_confirmed: null, inducement_type: [],
+  ltf_confirmation: '', full_sequence_complete: null,
+  entry_price: '', stop_price: '', stop_distance_pips: '', target_rr: '', target_description: '',
+  result: '', r_achieved: '', exit_reason: '',
+  rule_triggered: [], warning_signal_present: null, warning_signal_acted_on: null, failed_at_stage: [],
+  price_context: '', execution_notes: '', key_takeaway: '', chart_screenshot_url: '',
+};
+
+// ─── BacktestLogTab ───────────────────────────────────────────────────
+function BacktestLogTab() {
+  const [entry, setEntryRaw]   = useState({ ...BL_EMPTY });
+  const [saveState, setSaveState]         = useState('idle'); // idle | saving | saved | error
+  const [sqsScore,  setSqsScore]          = useState(null);
+  const [confirmIncomplete, setConfirmIncomplete] = useState(false);
+  const [overridePrompt,    setOverridePrompt]    = useState(null); // pending disp value
+  const [overrideApplied,   setOverrideApplied]   = useState(false);
+  const [recentLogs,  setRecentLogs]      = useState([]);
+  const [showLogs,    setShowLogs]        = useState(false);
+  const [cfTarget,    setCfTarget]        = useState(null);
+  const [cfForm,      setCfForm]          = useState({ setup_played_out: null, counterfactual_r: '', decision_correct: null });
+  const [cfSaving,    setCfSaving]        = useState(false);
+
+  const set       = (k, v) => setEntryRaw(p => ({ ...p, [k]: v }));
+  const toggleArr = (k, v) => setEntryRaw(p => {
+    const a = Array.isArray(p[k]) ? p[k] : [];
+    return { ...p, [k]: a.includes(v) ? a.filter(x => x !== v) : [...a, v] };
+  });
+
+  // Auto-calc stop distance pips
+  useEffect(() => {
+    const ep = parseFloat(entry.entry_price);
+    const sp = parseFloat(entry.stop_price);
+    if (!isNaN(ep) && !isNaN(sp) && ep > 0 && sp > 0) {
+      set('stop_distance_pips', (Math.abs(ep - sp) * 10000).toFixed(1));
+    }
+  }, [entry.entry_price, entry.stop_price]);
+
+  // Derived gate flags
+  const showS4       = ['Double Sweep', 'Complex Pullback', 'Multi-Stage Engineered Reversal'].includes(entry.sequence_type);
+  const s4Unlocked   = showS4 && entry.failed_continuation === true;
+  const primTierRank = BL_TIER_RANK[entry.liquidity_tier]       || 0;
+  const primDispRank = BL_DISP_RANK[entry.displacement_quality] || 0;
+
+  // Gate 3 — secondary displacement override handler
+  const handleSecDisp = v => {
+    const secRank = BL_DISP_RANK[v] || 0;
+    if (secRank < primDispRank) { setOverridePrompt(v); }
+    else { set('secondary_displacement_quality', v); set('second_sweep_override', false); setOverrideApplied(false); }
+  };
+  const confirmOverride = () => {
+    set('secondary_displacement_quality', overridePrompt);
+    set('second_sweep_override', true);
+    setOverridePrompt(null);
+    setOverrideApplied(true);
+  };
+
+  // Live SQS
+  const liveSQS  = useMemo(() => calculateSQS(entry), [entry]);
+  const liveBand = sqsBand(liveSQS);
+
+  // Save flow
+  const handleSave = () => {
+    if (entry.full_sequence_complete === false) { setConfirmIncomplete(true); return; }
+    doSave();
+  };
+
+  const doSave = async () => {
+    setSaveState('saving'); setConfirmIncomplete(false);
+    const score = liveSQS;
+    setSqsScore(score);
+    const band  = sqsBand(score);
+    const NUM   = ['sweep_distance_pips','poi_size_pips','entry_price','stop_price','stop_distance_pips','target_rr','r_achieved','displacement_body_ratio'];
+    const payload = { ...entry };
+    NUM.forEach(k => { const v = parseFloat(payload[k]); payload[k] = isNaN(v) ? null : v; });
+    Object.keys(payload).forEach(k => { if (payload[k] === '') payload[k] = null; });
+    // Section 10 is second-pass only — not written on initial insert
+    delete payload.setup_played_out; delete payload.counterfactual_r; delete payload.decision_correct;
+    payload.sqs_score           = score;
+    payload.grade               = band.grade;
+    payload.evaluated_at        = new Date().toISOString();
+    payload.enrichment_complete = true;
+    const { error } = await supabase.from('backtest_logs').insert(payload);
+    if (error) { setSaveState('error'); console.error('backtest_logs:', error); }
+    else       { setSaveState('saved'); setEntryRaw({ ...BL_EMPTY }); setOverrideApplied(false); loadRecentLogs(); }
+  };
+
+  const loadRecentLogs = async () => {
+    const { data } = await supabase
+      .from('backtest_logs')
+      .select('id,date,pair,direction,sequence_type,sqs_score,grade,result,setup_played_out,enrichment_complete')
+      .order('evaluated_at', { ascending: false }).limit(20);
+    if (data) setRecentLogs(data);
+  };
+
+  useEffect(() => { loadRecentLogs(); }, []);
+
+  const saveCF = async () => {
+    if (!cfTarget) return;
+    setCfSaving(true);
+    const { error } = await supabase.from('backtest_logs').update({
+      setup_played_out:  cfForm.setup_played_out,
+      counterfactual_r:  parseFloat(cfForm.counterfactual_r) || null,
+      decision_correct:  cfForm.decision_correct,
+    }).eq('id', cfTarget);
+    setCfSaving(false);
+    if (!error) { setCfTarget(null); loadRecentLogs(); }
+  };
+
+  // ── Micro UI components (scoped to BacktestLogTab) ──────────────────
+  const BSH = ({ children, note }) => (
+    <div className="flex items-center gap-2 text-xs text-gray-600 uppercase tracking-widest border-b border-gray-800 pb-1.5 mb-3 mt-5 first:mt-0">
+      <span>{children}</span>
+      {note && <span className="text-gray-700 normal-case tracking-normal ml-1">{note}</span>}
+    </div>
+  );
+
+  const TG = ({ opts, val, onSel, multi = false, disabled: disabledFn, cols = 3 }) => (
+    <div className="grid gap-1" style={{ gridTemplateColumns:`repeat(${cols},minmax(0,1fr))` }}>
+      {opts.map(([v, l]) => {
+        const dis    = disabledFn ? disabledFn(v) : false;
+        const active = multi ? (Array.isArray(val) && val.includes(v)) : val === v;
+        return (
+          <button key={v} disabled={dis}
+            onClick={() => { if(dis) return; multi ? onSel(v) : onSel(v === val ? '' : v); }}
+            className={`py-1.5 px-1 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
+              dis    ? 'border-gray-800 text-gray-800 bg-gray-950 cursor-not-allowed' :
+              active ? 'border-blue-600 bg-blue-950/40 text-blue-300' :
+                       'border-gray-700 text-gray-500 hover:border-gray-500 hover:text-gray-300 bg-gray-950'
+            }`}>{l || v}</button>
+        );
+      })}
+    </div>
+  );
+
+  const YN = ({ val, onChg, yes = 'Yes', no = 'No' }) => (
+    <div className="flex gap-1.5">
+      {[[true, yes],[false, no]].map(([b, lbl]) => (
+        <button key={String(b)} onClick={() => onChg(val === b ? null : b)}
+          className={`flex-1 py-1.5 rounded border text-xs cursor-pointer transition-colors ${
+            val === b
+              ? b ? 'border-green-700 bg-green-950/30 text-green-400' : 'border-red-800 bg-red-950/20 text-red-400'
+              : 'border-gray-700 text-gray-500 hover:border-gray-500'
+          }`}>{lbl}</button>
+      ))}
+    </div>
+  );
+
+  const NI = ({ val, onChg, ph }) => (
+    <input type="number" inputMode="decimal" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700"/>
+  );
+
+  const TxtIn = ({ val, onChg, ph }) => (
+    <input type="text" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700"/>
+  );
+
+  const TA2 = ({ val, onChg, ph, rows = 2 }) => (
+    <textarea value={val} onChange={e => onChg(e.target.value)} placeholder={ph} rows={rows}
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700 resize-none"/>
+  );
+
+  // Option lists
+  const O = {
+    pairs:    [['EURUSD','EUR/USD'],['GBPUSD','GBP/USD'],['USDJPY','USD/JPY'],['XAUUSD','XAU/USD'],['US30','US30'],['NAS100','NAS100']],
+    dir:      [['Long','↑ Long'],['Short','↓ Short']],
+    sess:     [['Frankfurt','Frankfurt'],['London','London Open'],['NY 2nd Hour','NY 2nd Hr'],['London Lunch','LDN Lunch'],['NY After Lunch','NY PM'],['Outside','Outside']],
+    bias:     [['Bullish','Bullish'],['Bearish','Bearish'],['Neutral','Neutral']],
+    seqTypes: [['Single Sweep','Single Sweep'],['Double Sweep','Double Sweep'],['Engineered Continuation','Eng. Cont.'],['Complex Pullback','Complex PB'],['Multi-Stage Engineered Reversal','Multi-Stage']],
+    models:   [['Bullish Reversal','Bull Rev'],['Bearish Reversal','Bear Rev'],['Bullish Continuation','Bull Cont'],['Bearish Continuation','Bear Cont'],['Engineered Reversal','Eng Rev'],['Engineered Continuation','Eng Cont']],
+    mstatus:  [['Active','Active'],['Pending','Pending'],['Invalid','Invalid']],
+    tiers:    [['Tier 1','Tier 1'],['Tier 2','Tier 2'],['Tier 3','Tier 3']],
+    liqType:  [['Equal Highs','EQ Highs'],['Equal Lows','EQ Lows'],['Session High','Sess H'],['Session Low','Sess L'],['HOPD','HOPD'],['HOPW','HOPW'],['Trendline Liquidity','Trendline'],['Internal Liquidity','Internal'],['Swing High','Swing H'],['Swing Low','Swing L'],['Frankfurt High','FKT H'],['Frankfurt Low','FKT L'],['London Open High','LON H'],['London Open Low','LON L'],['SMC Trap Zone','SMC Trap']],
+    sweepQ:   [['Clean','Clean'],['Induced','Induced'],['Partial','Partial']],
+    dispQ:    [['Strong','Strong'],['Moderate','Moderate'],['Weak','Weak']],
+    struct:   [['CHoCH','CHoCH'],['BOS','BOS'],['Unconfirmed','Unconfirmed']],
+    candleP:  [['Above 50%','Above 50%'],['Below 50%','Below 50%'],['At High/Low','At H/L']],
+    chochBos: [['CHoCH','CHoCH'],['BOS','BOS'],['Neither','Neither']],
+    indType:  [['Structural','Structural'],['EQH/EQL Buildup','EQH/EQL'],['Trendline Tap','TL Tap'],['Stop Hunt','Stop Hunt'],['Session Open','Sess Open']],
+    ltf:      [['M1 CHoCH','M1 CHoCH'],['M1 BOS','M1 BOS'],['Engulf','Engulf'],['None','None']],
+    poiT:     [['HTF','HTF'],['LTF','LTF']],
+    result:   [['Win','Win'],['Loss','Loss'],['Break Even','BE'],['No Trade','No Trade']],
+    exit:     [['Target Hit','Target Hit'],['Stop Hit','Stop Hit'],['Manual Close','Manual'],['Break Even','BE']],
+    rules:    [['Daily Loss Limit','Daily Limit'],['Over-Trading','Over-Trade'],['Revenge Trade','Revenge'],['FOMO Entry','FOMO'],['Wrong Session','Bad Session'],['Bias Ignored','Bias Ignored'],['No Inducement','No Induce'],['Premature Entry','Premature']],
+    failSt:   [['POI','POI'],['Time','Time'],['Liquidity','Liquidity'],['Inducement','Induce'],['Displacement','Disp'],['Failure Model','Fail Model'],['BOS','BOS'],['RIFC','RIFC']],
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-3 pb-16">
+
+      {/* ── Live SQS badge ──────────────────────────────────────── */}
+      <div className={`flex items-center justify-between bg-gray-950 border rounded-sm px-4 py-2.5 ${liveBand.ring}`}>
+        <div className="flex items-center gap-2">
+          <span className="text-gray-600 text-xs uppercase tracking-widest">SQS</span>
+          <span className={`font-bold text-2xl ${liveBand.color}`}>{liveSQS}</span>
+          <span className={`font-bold text-xs ml-1 ${liveBand.color}`}>{liveBand.grade}</span>
+        </div>
+        <span className={`text-xs ${liveBand.color}`}>{liveBand.label}</span>
+        {overrideApplied && (
+          <span className="text-xs text-orange-400 border border-orange-700 bg-orange-950/20 rounded px-2 py-0.5 ml-2">⚠ Override −8</span>
+        )}
+      </div>
+
+      {/* Bias warning */}
+      {entry.bias_aligned === false && (
+        <div className="border border-yellow-700 bg-yellow-950/20 rounded-sm px-3 py-2 text-xs text-yellow-400">
+          ⚠️ HTF Bias NOT aligned — entry goes against higher timeframe direction. This flag persists on the logged entry.
+        </div>
+      )}
+
+      {/* Auto NO TRADE warning */}
+      {liveSQS < 40 && liveSQS > 0 && (
+        <div className="border border-red-800 bg-red-950/20 rounded-sm px-3 py-2 text-xs text-red-400">
+          🔴 SQS below 40 — Auto NO TRADE threshold. Entry will be flagged on save.
+        </div>
+      )}
+
+      <Panel>
+        {/* ── S1 Context ──────────────────────────────────────── */}
+        <BSH>1 — Context</BSH>
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <FL>Date</FL>
+              <input type="date" value={entry.date} onChange={e=>set('date',e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none"/>
+            </div>
+            <div><FL>Pair</FL><TG opts={O.pairs} val={entry.pair} onSel={v=>set('pair',v)} cols={2}/></div>
+          </div>
+          <div><FL>Direction</FL><TG opts={O.dir} val={entry.direction} onSel={v=>set('direction',v)} cols={2}/></div>
+          <div><FL>Session</FL><TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={3}/></div>
+          <div><FL>HTF Bias</FL><TG opts={O.bias} val={entry.htf_bias} onSel={v=>set('htf_bias',v)} cols={3}/></div>
+          <div><FL>Bias Aligned?</FL><YN val={entry.bias_aligned} onChg={v=>set('bias_aligned',v)}/></div>
+        </div>
+
+        {/* ── S2 Model / Sequence ─────────────────────────────── */}
+        <BSH>2 — Model / Sequence</BSH>
+        <div className="space-y-3">
+          <div><FL>Model Type (multi)</FL><TG opts={O.models} val={entry.model_type} onSel={v=>toggleArr('model_type',v)} multi cols={3}/></div>
+          <div><FL>Model Status</FL><TG opts={O.mstatus} val={entry.model_status} onSel={v=>set('model_status',v)} cols={3}/></div>
+          <div><FL>Sequence Type</FL><TG opts={O.seqTypes} val={entry.sequence_type} onSel={v=>set('sequence_type',v)} cols={2}/></div>
+        </div>
+
+        {/* ── S3 Primary Sweep ────────────────────────────────── */}
+        <BSH>3 — Primary Sweep</BSH>
+        <div className="space-y-3">
+          <div><FL>Liquidity Tier</FL><TG opts={O.tiers} val={entry.liquidity_tier} onSel={v=>set('liquidity_tier',v)} cols={3}/></div>
+          <div><FL>Liquidity Type (multi)</FL><TG opts={O.liqType} val={entry.liquidity_type} onSel={v=>toggleArr('liquidity_type',v)} multi cols={3}/></div>
+          <div><FL>Sweep Quality</FL><TG opts={O.sweepQ} val={entry.sweep_quality} onSel={v=>set('sweep_quality',v)} cols={3}/></div>
+          <div><FL>Sweep Distance (pips)</FL><NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/></div>
+        </div>
+
+        {/* ── S4 Second Sweep (conditional) ───────────────────── */}
+        {showS4 && (
+          <>
+            <BSH note="— gates apply">4 — Second Sweep</BSH>
+            <div className="space-y-3">
+              <div><FL>Failed Continuation?</FL><YN val={entry.failed_continuation} onChg={v=>set('failed_continuation',v)}/></div>
+              {entry.failed_continuation === false && (
+                <div className="text-xs text-gray-700 border border-gray-800 rounded px-3 py-2">
+                  Gate 1 not met — Section 4 fields hidden (failed_continuation = No).
+                </div>
+              )}
+              {s4Unlocked && (
+                <div className="space-y-3 border-l-2 border-gray-800 pl-3 ml-1">
+                  <div>
+                    <FL>Secondary Liquidity Tier</FL>
+                    <div className="text-xs text-gray-700 mb-1.5">Second sweep must match or exceed primary tier. Lower tiers are greyed out.</div>
+                    <TG opts={O.tiers} val={entry.secondary_liquidity_tier} onSel={v=>set('secondary_liquidity_tier',v)}
+                      disabled={v => (BL_TIER_RANK[v]||0) < primTierRank} cols={3}/>
+                  </div>
+                  <div><FL>Secondary Liquidity Type (multi)</FL><TG opts={O.liqType} val={entry.secondary_liquidity_type} onSel={v=>toggleArr('secondary_liquidity_type',v)} multi cols={3}/></div>
+                  <div><FL>Secondary Sweep Quality</FL><TG opts={O.sweepQ} val={entry.secondary_sweep_quality} onSel={v=>set('secondary_sweep_quality',v)} cols={3}/></div>
+                  <div>
+                    <FL>Secondary Displacement Quality</FL>
+                    <TG opts={O.dispQ} val={entry.secondary_displacement_quality} onSel={handleSecDisp} cols={3}/>
+                    {overrideApplied && (
+                      <div className="mt-1.5 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-1.5">
+                        ⚠ Override Applied — secondary weaker than primary. SQS −8 penalty active. Cannot be waived.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* ── S5 Displacement / Structure ─────────────────────── */}
+        <BSH>5 — Displacement / Structure</BSH>
+        <div className="space-y-3">
+          <div><FL>Displacement Confirmed?</FL><YN val={entry.displacement_confirmed} onChg={v=>set('displacement_confirmed',v)}/></div>
+          <div><FL>Displacement Quality</FL><TG opts={O.dispQ} val={entry.displacement_quality} onSel={v=>set('displacement_quality',v)} cols={3}/></div>
+          <div><FL>Displacement Body Ratio (%)</FL><NI val={entry.displacement_body_ratio} onChg={v=>set('displacement_body_ratio',v)} ph="e.g. 75"/></div>
+          <div><FL>Candle Close Position</FL><TG opts={O.candleP} val={entry.candle_close_position} onSel={v=>set('candle_close_position',v)} cols={3}/></div>
+          <div><FL>CHoCH or BOS Present?</FL><TG opts={O.chochBos} val={entry.choch_or_bos} onSel={v=>set('choch_or_bos',v)} cols={3}/></div>
+          <div><FL>Structure Confirmation</FL><TG opts={O.struct} val={entry.structure_confirmation} onSel={v=>set('structure_confirmation',v)} cols={3}/></div>
+        </div>
+
+        {/* ── S6 POI / Inducement ─────────────────────────────── */}
+        <BSH>6 — POI / Inducement</BSH>
+        <div className="space-y-3">
+          <div><FL>POI Type</FL><TG opts={O.poiT} val={entry.poi_type} onSel={v=>set('poi_type',v)} cols={2}/></div>
+          <div><FL>POI Size (pips)</FL><NI val={entry.poi_size_pips} onChg={v=>set('poi_size_pips',v)} ph="e.g. 15"/></div>
+          <div><FL>Inducement Confirmed?</FL><YN val={entry.inducement_confirmed} onChg={v=>set('inducement_confirmed',v)}/></div>
+          <div><FL>Inducement Type (multi)</FL><TG opts={O.indType} val={entry.inducement_type} onSel={v=>toggleArr('inducement_type',v)} multi cols={2}/></div>
+          <div><FL>LTF Confirmation</FL><TG opts={O.ltf} val={entry.ltf_confirmation} onSel={v=>set('ltf_confirmation',v)} cols={2}/></div>
+          <div><FL>Full Sequence Complete?</FL><YN val={entry.full_sequence_complete} onChg={v=>set('full_sequence_complete',v)}/></div>
+        </div>
+
+        {/* ── S7 Entry Details ────────────────────────────────── */}
+        <BSH>7 — Entry Details</BSH>
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div><FL>Entry Price</FL><NI val={entry.entry_price} onChg={v=>set('entry_price',v)} ph="1.08450"/></div>
+            <div><FL>Stop Price</FL><NI val={entry.stop_price} onChg={v=>set('stop_price',v)} ph="1.08320"/></div>
+          </div>
+          {entry.stop_distance_pips && (
+            <div className="text-xs text-blue-400 border border-blue-900 bg-blue-950/20 rounded px-3 py-1.5">
+              Stop Distance: <span className="font-bold">{entry.stop_distance_pips}p</span> <span className="text-gray-600">(auto-calculated)</span>
+            </div>
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            <div><FL>Target RR</FL><NI val={entry.target_rr} onChg={v=>set('target_rr',v)} ph="e.g. 5"/></div>
+            <div><FL>Target Description</FL><TxtIn val={entry.target_description} onChg={v=>set('target_description',v)} ph="e.g. LDL at 1.0900"/></div>
+          </div>
+        </div>
+
+        {/* ── S8 Outcome ──────────────────────────────────────── */}
+        <BSH>8 — Outcome</BSH>
+        <div className="space-y-3">
+          <div><FL>Result</FL><TG opts={O.result} val={entry.result} onSel={v=>set('result',v)} cols={4}/></div>
+          <div><FL>R Achieved</FL><NI val={entry.r_achieved} onChg={v=>set('r_achieved',v)} ph="e.g. 6.5"/></div>
+          <div><FL>Exit Reason</FL><TG opts={O.exit} val={entry.exit_reason} onSel={v=>set('exit_reason',v)} cols={4}/></div>
+        </div>
+
+        {/* ── S9 Rules / Warnings ─────────────────────────────── */}
+        <BSH>9 — Rules / Warnings</BSH>
+        <div className="space-y-3">
+          <div><FL>Rule Triggered (multi)</FL><TG opts={O.rules} val={entry.rule_triggered} onSel={v=>toggleArr('rule_triggered',v)} multi cols={3}/></div>
+          <div><FL>Warning Signal Present?</FL><YN val={entry.warning_signal_present} onChg={v=>set('warning_signal_present',v)}/></div>
+          {entry.warning_signal_present && (
+            <div><FL>Warning Signal Acted On?</FL><YN val={entry.warning_signal_acted_on} onChg={v=>set('warning_signal_acted_on',v)}/></div>
+          )}
+          <div><FL>Failed At Stage (multi)</FL><TG opts={O.failSt} val={entry.failed_at_stage} onSel={v=>toggleArr('failed_at_stage',v)} multi cols={4}/></div>
+        </div>
+
+        {/* ── S11 Notes (S10 is second-pass) ──────────────────── */}
+        <BSH note="— Section 10 (Counterfactual) added after trade plays out">11 — Notes</BSH>
+        <div className="space-y-3">
+          <div><FL>Price Context</FL><TA2 val={entry.price_context} onChg={v=>set('price_context',v)} ph="Where was price? What was the macro context?"/></div>
+          <div><FL>Execution Notes</FL><TA2 val={entry.execution_notes} onChg={v=>set('execution_notes',v)} ph="How did you enter? Any hesitation?"/></div>
+          <div><FL>Key Takeaway</FL><TA2 val={entry.key_takeaway} onChg={v=>set('key_takeaway',v)} ph="What did this trade teach you?"/></div>
+          <div><FL>Chart Screenshot URL</FL><TxtIn val={entry.chart_screenshot_url} onChg={v=>set('chart_screenshot_url',v)} ph="https://…"/></div>
+        </div>
+
+        {/* ── Save ────────────────────────────────────────────── */}
+        <div className="mt-5 pt-4 border-t border-gray-800 space-y-2">
+          {saveState === 'error' && (
+            <div className="text-xs text-red-400 border border-red-800 bg-red-950/20 rounded px-3 py-2">❌ Save failed — check browser console for details.</div>
+          )}
+          {saveState === 'saved' && (
+            <div className="text-xs text-green-400 border border-green-800 bg-green-950/20 rounded px-3 py-2">
+              ✓ Logged — SQS {sqsScore} ({sqsBand(sqsScore).grade}). Add counterfactual (Section 10) below once the trade plays out.
+            </div>
+          )}
+          <button onClick={handleSave} disabled={saveState === 'saving'}
+            className={`w-full py-2 rounded border text-xs uppercase tracking-widest cursor-pointer transition-colors ${
+              saveState === 'saving' ? 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed' :
+              'bg-blue-950/20 hover:bg-blue-950/40 border-blue-700 text-blue-400'
+            }`}>
+            {saveState === 'saving' ? 'Saving…' : '+ Log Backtest Entry'}
+          </button>
+        </div>
+      </Panel>
+
+      {/* ── Override prompt modal ──────────────────────────────────── */}
+      {overridePrompt !== null && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+          <div className="bg-gray-950 border border-orange-700 rounded-sm p-5 max-w-sm w-full shadow-2xl">
+            <div className="text-orange-400 font-bold text-sm mb-2">⚠ Override Required</div>
+            <div className="text-xs text-gray-300 leading-relaxed mb-4">
+              Secondary displacement (<span className="text-orange-300 font-bold">{overridePrompt}</span>) is weaker
+              than primary displacement (<span className="font-bold">{entry.displacement_quality}</span>).<br/><br/>
+              Proceeding applies a <span className="text-red-400 font-bold">−8 SQS penalty</span> and flags this
+              entry with <span className="text-orange-400">Override Applied</span>. This cannot be waived.
+            </div>
+            <div className="flex gap-2">
+              <button onClick={confirmOverride} className="flex-1 py-1.5 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded cursor-pointer hover:bg-orange-950/40">
+                Accept Override + −8 SQS
+              </button>
+              <button onClick={()=>setOverridePrompt(null)} className="flex-1 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Confirm incomplete modal ───────────────────────────────── */}
+      {confirmIncomplete && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+          <div className="bg-gray-950 border border-yellow-700 rounded-sm p-5 max-w-sm w-full shadow-2xl">
+            <div className="text-yellow-400 font-bold text-sm mb-2">⚠ Sequence Incomplete</div>
+            <div className="text-xs text-gray-300 leading-relaxed mb-4">
+              Full sequence is not marked complete. Are you sure you want to log this entry?
+            </div>
+            <div className="flex gap-2">
+              <button onClick={doSave} className="flex-1 py-1.5 text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded cursor-pointer">Log Anyway</button>
+              <button onClick={()=>setConfirmIncomplete(false)} className="flex-1 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Go Back</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Saved logs + Section 10 second-pass ───────────────────── */}
+      <div className="bg-gray-950 border border-gray-800 rounded-sm">
+        <button onClick={()=>{ setShowLogs(l=>!l); if(!showLogs) loadRecentLogs(); }}
+          className="w-full flex items-center justify-between px-4 py-2.5 text-xs text-gray-500 hover:text-gray-300 cursor-pointer">
+          <span className="uppercase tracking-widest">📓 Recent Backtest Logs ({recentLogs.length})</span>
+          <span>{showLogs ? '▲' : '▼'}</span>
+        </button>
+        {showLogs && (
+          <div className="border-t border-gray-800">
+            {recentLogs.length === 0 && <div className="px-4 py-3 text-xs text-gray-700">No entries yet.</div>}
+            {recentLogs.map(log => {
+              const b      = log.sqs_score != null ? sqsBand(log.sqs_score) : { grade:'—', color:'text-gray-600' };
+              const needCF = log.setup_played_out == null;
+              return (
+                <div key={log.id} className="border-b border-gray-800/50 last:border-b-0 px-4 py-2.5">
+                  <div className="flex items-center gap-2 flex-wrap text-xs">
+                    <span className="text-gray-600">{log.date}</span>
+                    <span className="text-gray-300 font-bold">{log.pair}</span>
+                    <span className={log.direction==='Long'?'text-green-500':'text-red-500'}>{log.direction}</span>
+                    <span className="text-gray-600 truncate max-w-[120px]">{log.sequence_type}</span>
+                    {log.sqs_score != null && <span className={`font-bold ml-auto ${b.color}`}>SQS {log.sqs_score} {b.grade}</span>}
+                    <span className={log.result==='Win'?'text-green-500':log.result==='Loss'?'text-red-500':'text-gray-500'}>{log.result||'—'}</span>
+                    {!log.enrichment_complete && <span className="text-yellow-600 border border-yellow-800 rounded px-1">enrichment pending</span>}
+                    {entry.bias_aligned === false && <span className="text-yellow-500 border border-yellow-800 rounded px-1">⚠ bias unaligned</span>}
+                  </div>
+                  {needCF && cfTarget !== log.id && (
+                    <button onClick={()=>{ setCfTarget(log.id); setCfForm({ setup_played_out:null, counterfactual_r:'', decision_correct:null }); }}
+                      className="mt-1.5 text-xs text-blue-400 border border-blue-900 hover:bg-blue-950/20 rounded px-2 py-0.5 cursor-pointer">
+                      + Add Counterfactual (Section 10)
+                    </button>
+                  )}
+                  {log.setup_played_out != null && (
+                    <div className="mt-1 text-xs text-gray-600">
+                      ✓ CF: {log.setup_played_out ? 'Played out' : 'Did not play'} · R {log.counterfactual_r ?? '—'} · {log.decision_correct ? 'Correct decision' : 'Decision incorrect'}
+                    </div>
+                  )}
+                  {cfTarget === log.id && (
+                    <div className="mt-2 border border-blue-900 bg-blue-950/10 rounded p-3 space-y-2.5">
+                      <div className="text-xs text-blue-400 font-bold uppercase tracking-wider">Section 10 — Counterfactual</div>
+                      <div>
+                        <FL>Did the setup play out after you closed / passed?</FL>
+                        <YN val={cfForm.setup_played_out} onChg={v=>setCfForm(p=>({...p,setup_played_out:v}))} yes="Yes — Played out" no="No — Did not play"/>
+                      </div>
+                      <div>
+                        <FL>Counterfactual R (what it would have achieved)</FL>
+                        <NI val={cfForm.counterfactual_r} onChg={v=>setCfForm(p=>({...p,counterfactual_r:v}))} ph="e.g. 8.0"/>
+                      </div>
+                      <div>
+                        <FL>Was the original decision correct?</FL>
+                        <YN val={cfForm.decision_correct} onChg={v=>setCfForm(p=>({...p,decision_correct:v}))} yes="Yes — Correct" no="No — Should have acted differently"/>
+                      </div>
+                      <div className="flex gap-2 pt-1">
+                        <button onClick={saveCF} disabled={cfSaving}
+                          className={`flex-1 py-1.5 text-xs rounded border cursor-pointer transition-colors ${cfSaving?'border-gray-700 text-gray-600':'border-blue-700 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50'}`}>
+                          {cfSaving ? 'Saving…' : 'Save Counterfactual'}
+                        </button>
+                        <button onClick={()=>setCfTarget(null)} className="px-3 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // ROOT COMPONENT
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2868,6 +3400,7 @@ export default function WTA1() {
     { id:"trees",     label:"🌳 Decision Trees" },
     { id:"journal",   label:`📋 Journal (${journal.length})` },
     { id:"analytics", label:"📊 Analytics" },
+    { id:"backtest",  label:"📓 Backtest Log" },
   ];
 
   return (
@@ -2912,6 +3445,7 @@ export default function WTA1() {
         {tab==="trees"&&<DecisionTreeTab inp={inp}/>}
         {tab==="journal"&&<JournalTab journal={journal} setJournal={setJournal} journalLoading={journalLoading} journalError={journalError} livePreFill={livePreFill} clearLivePreFill={clearLivePreFill} addTrade={addToJournal}/>}
         {tab==="analytics"&&<AnalyticsTab journal={journal}/>}
+        {tab==="backtest"&&<BacktestLogTab/>}
       </div>
 
       {/* DISCIPLINE — always at bottom */}
