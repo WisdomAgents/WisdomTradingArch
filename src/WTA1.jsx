@@ -2777,12 +2777,54 @@ function BacktestLogTab() {
   const [cfSaving,    setCfSaving]        = useState(false);
   const [imgUploading, setImgUploading]  = useState(false);
   const [imgError,     setImgError]      = useState('');
+  const [validationErrors, setValidationErrors] = useState({});
 
   const set       = (k, v) => setEntryRaw(p => ({ ...p, [k]: v }));
   const toggleArr = (k, v) => setEntryRaw(p => {
     const a = Array.isArray(p[k]) ? p[k] : [];
     return { ...p, [k]: a.includes(v) ? a.filter(x => x !== v) : [...a, v] };
   });
+
+  // FIX 2: Validation function
+  const validateStep = (id) => {
+    const errs = {};
+    switch(id) {
+      case 'context':
+        if (!entry.direction) errs.direction = 'Required';
+        if (!entry.session) errs.session = 'Required';
+        if (!entry.htf_bias) errs.htf_bias = 'Required';
+        if (entry.bias_aligned === null) errs.bias_aligned = 'Required';
+        break;
+      case 'sequence':
+        if (!Array.isArray(entry.model_type) || entry.model_type.length === 0) errs.model_type = 'Required';
+        if (!entry.sequence_type) errs.sequence_type = 'Required';
+        break;
+      case 'primary_sweep':
+        if (!Array.isArray(entry.liquidity_type) || entry.liquidity_type.length === 0) errs.liquidity_type = 'Required';
+        if (!entry.sweep_quality) errs.sweep_quality = 'Required';
+        break;
+      case 'second_sweep':
+        // No required fields for second_sweep
+        break;
+      case 'displacement':
+        if (entry.displacement_confirmed === null) errs.displacement_confirmed = 'Required';
+        if (!entry.displacement_quality) errs.displacement_quality = 'Required';
+        if (!entry.choch_or_bos) errs.choch_or_bos = 'Required';
+        if (!entry.structure_confirmation) errs.structure_confirmation = 'Required';
+        break;
+      case 'poi':
+        if (!entry.poi_type) errs.poi_type = 'Required';
+        if (entry.inducement_confirmed === null) errs.inducement_confirmed = 'Required';
+        if (!entry.ltf_confirmation) errs.ltf_confirmation = 'Required';
+        if (entry.full_sequence_complete === null) errs.full_sequence_complete = 'Required';
+        break;
+      case 'outcome':
+        if (!entry.result) errs.result = 'Required';
+        if (!entry.trade_grade) errs.trade_grade = 'Required';
+        break;
+    }
+    return errs;
+  };
 
   // Chart screenshot upload to Supabase Storage
   const handleImgUpload = async e => {
@@ -2869,7 +2911,7 @@ function BacktestLogTab() {
       case 'outcome':
         return `${entry.result||'—'} · ${entry.r_achieved||'—'}R · ${entry.exit_reason||'—'} · Grade: ${entry.trade_grade||'—'}`;
       case 'rules':
-        return `Rules: ${(entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):'None'} · Warning: ${entry.warning_signal_present===true?'Yes':entry.warning_signal_present===false?'No':'—'}`;
+        return `Rules: ${entry.rule_triggered === 'NONE' ? 'None' : (entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):'None'} · Warning: ${entry.warning_signal_present===true?'Yes':entry.warning_signal_present===false?'No':entry.warning_signal_present==='none'?'No Warning':'—'}`;
       case 'notes':
         return entry.key_takeaway ? (entry.key_takeaway.length>55?entry.key_takeaway.slice(0,55)+'…':entry.key_takeaway) : '—';
       default: return '—';
@@ -2956,8 +2998,9 @@ function BacktestLogTab() {
     </div>
   );
 
+  // FIX 1: Change type="number" to type="text"
   const NI = ({ val, onChg, ph }) => (
-    <input type="number" inputMode="decimal" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
+    <input type="text" inputMode="decimal" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
       className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2.5 rounded focus:outline-none focus:border-gray-500 placeholder-gray-700"/>
   );
 
@@ -2978,11 +3021,62 @@ function BacktestLogTab() {
     </div>
   ) : null;
 
+  // FIX 5: Define tooltip maps
+  const MODEL_TIPS = {
+    'Bullish Reversal': 'Bearish market reverses to bullish. Price sweeps sell-side liquidity then displaces up',
+    'Bearish Reversal': 'Bullish market reverses to bearish. Price sweeps buy-side liquidity then displaces down',
+    'Bullish Continuation': 'Existing bullish trend continues. Pullback into demand then continuation higher',
+    'Bearish Continuation': 'Existing bearish trend continues. Pullback into supply then continuation lower',
+    'Engineered Reversal': 'Engineered Reversal. Smart money engineers multiple liquidity events to build conditions for a reversal',
+    'Engineered Continuation': 'Engineered Continuation. No prior trend. Smart money builds conditions for a move through engineered sweeps',
+  };
+
+  const SEQ_TIPS = {
+    'Single Sweep': 'One liquidity sweep, one displacement, standard entry. Most common setup',
+    'Double Sweep': 'Two sweeps of different levels before entry. Second sweep structurally related to first',
+    'Complex Pullback': 'Trend already established. Price engineers liquidity during the pullback before continuing the original move',
+    'Engineered Continuation': 'No prior trend. Engineering builds conditions for a move that has not happened yet',
+    'Multi-Stage Engineered Reversal': 'Minimum two distinct engineered liquidity events. RIFC entry mandatory. Real CHoCH required',
+  };
+
+  const RULE_TIPS = {
+    'Daily Loss Limit': 'You have already hit your maximum trades for the day and took this trade anyway',
+    'Over-Trading': 'You took more trades than your plan allows in one session',
+    'Revenge Trade': 'You took this trade to recover losses from a previous trade',
+    'FOMO Entry': 'You entered because you feared missing the move not because the setup was valid',
+    'Wrong Session': 'You traded outside your designated trading window',
+    'Bias Ignored': 'You traded against your HTF bias without a valid reason',
+    'No Inducement': 'You entered without a confirmed inducement event',
+    'Premature Entry': 'You entered before the full sequence was complete',
+  };
+
+  // FIX 3: Liquidity tier grid data
+  const TIER_COLS = [
+    {
+      tier: 'Tier 1',
+      header: 'TIER 1 — MACRO',
+      items: ['Weekly High','Weekly Low','PDH','PDL','PDC','Daily Open'],
+      tip: 'Highest significance levels. Visible on Daily and Weekly charts. PDH, PDL, Weekly highs and lows',
+    },
+    {
+      tier: 'Tier 2',
+      header: 'TIER 2 — SESSION',
+      items: ['Asia High','Asia Low','Asia Open','London Open High','London Open Low','London Open Price','London Lunch High','London Lunch Low','NY Open High','NY Open Low','NY Open Price','Frankfurt High','Frankfurt Low','Kill Zone High','Kill Zone Low'],
+      tip: 'Session-based levels created during specific trading sessions. Asia, London, NY highs and lows',
+    },
+    {
+      tier: 'Tier 3',
+      header: 'TIER 3 — INTERNAL',
+      items: ['EQ Highs','EQ Lows','Trendline Liquidity','Internal Range','Swing High','Swing Low'],
+      tip: 'Internal range levels. Lower significance. EQ highs and lows, swing points, trendlines',
+    },
+  ];
+
   // Option lists
   const O = {
     pairs:    [['EURUSD','EUR/USD'],['GBPUSD','GBP/USD'],['USDJPY','USD/JPY'],['XAUUSD','XAU/USD'],['US30','US30'],['NAS100','NAS100']],
     dir:      [['Long','↑ Long'],['Short','↓ Short']],
-    sess:     [['Frankfurt','Frankfurt'],['London','London Open'],['NY 2nd Hour','NY 2nd Hr'],['London Lunch','LDN Lunch'],['NY After Lunch','NY PM'],['Outside','Outside']],
+    sess:     [['Frankfurt','Frankfurt'],['London','London Open'],['NY 1st Hour','NY 1st Hr'],['NY 2nd Hour','NY 2nd Hr'],['London Lunch','LDN Lunch'],['NY After Lunch','NY PM'],['Outside','Outside']],
     bias:     [['Bullish','Bullish'],['Bearish','Bearish'],['Neutral','Neutral']],
     seqTypes: [['Single Sweep','Single Sweep'],['Double Sweep','Double Sweep'],['Engineered Continuation','Eng. Cont.'],['Complex Pullback','Complex PB'],['Multi-Stage Engineered Reversal','Multi-Stage']],
     models:   [['Bullish Reversal','Bull Rev'],['Bearish Reversal','Bear Rev'],['Bullish Continuation','Bull Cont'],['Bearish Continuation','Bear Cont'],['Engineered Reversal','Eng Rev'],['Engineered Continuation','Eng Cont']],
@@ -3011,15 +3105,21 @@ function BacktestLogTab() {
       <div className={`sticky top-0 z-30 flex items-center justify-between bg-gray-950/95 backdrop-blur border-b ${liveBand.ring} px-4 py-2.5`}>
         <div className="flex items-center gap-2.5">
           <span className="text-gray-600 text-xs uppercase tracking-widest">SQS</span>
-          <span className={`font-bold text-xl ${liveBand.color}`}>{liveSQS}</span>
-          <span className={`text-xs font-bold ${liveBand.color}`}>{liveBand.grade}</span>
-          <span className="text-gray-700 mx-0.5">—</span>
-          <span className={`text-xs ${liveBand.color}`}>{liveBand.label}</span>
+          {!entry.liquidity_tier || !entry.displacement_quality ? (
+            <span className="text-gray-600 text-xs">— Fill in fields to calculate</span>
+          ) : (
+            <>
+              <span className={`font-bold text-xl ${liveBand.color}`}>{liveSQS}</span>
+              <span className={`text-xs font-bold ${liveBand.color}`}>{liveBand.grade}</span>
+              <span className="text-gray-700 mx-0.5">—</span>
+              <span className={`text-xs ${liveBand.color}`}>{liveBand.label}</span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-1.5 flex-wrap justify-end">
           {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override −8</span>}
           {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
-          {liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+          {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
         </div>
       </div>
 
@@ -3074,36 +3174,133 @@ function BacktestLogTab() {
                 </div>
                 <div><FL>Pair</FL><TG opts={O.pairs} val={entry.pair} onSel={v=>set('pair',v)} cols={2}/></div>
               </div>
-              <div><FL>Direction</FL><TG opts={O.dir} val={entry.direction} onSel={v=>set('direction',v)} cols={2}/></div>
-              <div><FL>Session</FL><TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={3}/></div>
-              <div><FL>HTF Bias</FL><TG opts={O.bias} val={entry.htf_bias} onSel={v=>set('htf_bias',v)} cols={3}/></div>
-              <div><FL>Bias Aligned?</FL><YN val={entry.bias_aligned} onChg={v=>set('bias_aligned',v)}/></div>
+              <div>
+                <div className={validationErrors.direction ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Direction</FL>
+                  <TG opts={O.dir} val={entry.direction} onSel={v=>set('direction',v)} cols={2}/>
+                </div>
+                {validationErrors.direction && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.session ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Session</FL>
+                  <TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={4}/>
+                </div>
+                {validationErrors.session && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.htf_bias ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>HTF Bias</FL>
+                  <TG opts={O.bias} val={entry.htf_bias} onSel={v=>set('htf_bias',v)} cols={3}/>
+                </div>
+                {validationErrors.htf_bias && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.bias_aligned ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Bias Aligned?</FL>
+                  <YN val={entry.bias_aligned} onChg={v=>set('bias_aligned',v)}/>
+                </div>
+                {validationErrors.bias_aligned && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
             </div>
           )}
 
           {/* S2 — Model / Sequence */}
           {currentId === 'sequence' && (
             <div className="space-y-4">
-              <div><FL>Model Type (multi)</FL><TG opts={O.models} val={entry.model_type} onSel={v=>toggleArr('model_type',v)} multi cols={3}/></div>
+              <div>
+                <FL>Model Type <InfoTip content="Select all model types that apply to this setup"/></FL>
+                <div className={`grid gap-1.5 grid-cols-3 ${validationErrors.model_type ? 'ring-1 ring-red-500 rounded' : ''}`}>
+                  {O.models.map(([v, l]) => {
+                    const active = Array.isArray(entry.model_type) && entry.model_type.includes(v);
+                    return (
+                      <button key={v} onClick={() => toggleArr('model_type', v)}
+                        className={`relative py-3 px-2 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
+                          active ? 'border-blue-500 bg-blue-900/60 text-blue-100 font-bold ring-1 ring-blue-500 ring-inset' :
+                                   'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950 hover:bg-gray-900'
+                        }`}>
+                        <span>{l}</span>
+                        <span className="absolute top-1 right-1"><InfoTip content={MODEL_TIPS[v]} position="left"/></span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {validationErrors.model_type && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
               <div><FL>Model Status</FL><TG opts={O.mstatus} val={entry.model_status} onSel={v=>set('model_status',v)} cols={3}/></div>
-              <div><FL>Sequence Type</FL><TG opts={O.seqTypes} val={entry.sequence_type} onSel={v=>set('sequence_type',v)} cols={2}/></div>
+              <div>
+                <FL>Sequence Type</FL>
+                <div>
+                  <div className={validationErrors.sequence_type ? 'ring-1 ring-red-500 rounded' : ''}>
+                    <div className="grid gap-1.5 grid-cols-2">
+                      {O.seqTypes.map(([v, l]) => {
+                        const active = entry.sequence_type === v;
+                        return (
+                          <button key={v} onClick={() => set('sequence_type', active ? '' : v)}
+                            className={`relative py-3 px-2 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
+                              active ? 'border-blue-500 bg-blue-900/60 text-blue-100 font-bold ring-1 ring-blue-500 ring-inset' :
+                                       'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950 hover:bg-gray-900'
+                            }`}>
+                            <span>{l}</span>
+                            <span className="absolute top-1 right-1"><InfoTip content={SEQ_TIPS[v]} position="left"/></span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {validationErrors.sequence_type && <div className="mt-1 text-xs text-red-500">Required</div>}
+                </div>
+              </div>
             </div>
           )}
 
           {/* S3 — Primary Sweep */}
           {currentId === 'primary_sweep' && (
             <div className="space-y-4">
-              <div><FL>Liquidity Tier</FL><TG opts={O.tiers} val={entry.liquidity_tier} onSel={v=>set('liquidity_tier',v)} cols={3}/></div>
-              <div><FL>Liquidity Type (multi)</FL><TG opts={O.liqType} val={entry.liquidity_type} onSel={v=>toggleArr('liquidity_type',v)} multi cols={3}/></div>
+              <div>
+                <FL>Liquidity Pool <InfoTip content="Select liquidity levels that will be swept by this trade"/></FL>
+                <div className={`grid grid-cols-3 gap-2 ${validationErrors.liquidity_type ? 'ring-1 ring-red-500 rounded p-2' : ''}`}>
+                  {TIER_COLS.map(col => (
+                    <div key={col.tier}>
+                      <div className="flex items-center gap-1 mb-2 pb-1 border-b border-gray-800">
+                        <span className="text-gray-600 text-xs uppercase tracking-widest leading-tight">{col.header}</span>
+                        <InfoTip content={col.tip}/>
+                      </div>
+                      <div className="space-y-1">
+                        {col.items.map(item => {
+                          const active = entry.liquidity_type.includes(item);
+                          return (
+                            <button key={item} onClick={() => {
+                              toggleArr('liquidity_type', item);
+                              set('liquidity_tier', col.tier);
+                            }}
+                              className={`w-full text-left px-2 py-1.5 rounded border text-xs cursor-pointer transition-colors leading-tight ${
+                                active ? 'border-blue-500 bg-blue-900/60 text-blue-100 ring-1 ring-blue-500 ring-inset' :
+                                         'border-gray-800 text-gray-500 hover:border-gray-600 hover:text-gray-300 bg-gray-950'
+                              }`}>{item}</button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {validationErrors.liquidity_type && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
               <div><FL>Sweep Quality</FL><TG opts={O.sweepQ} val={entry.sweep_quality} onSel={v=>set('sweep_quality',v)} cols={3}/></div>
-              <div><FL>Sweep Distance (pips)</FL><NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/></div>
+              <div>
+                <FL>Sweep Distance (pips) <InfoTip content="Measure from the liquidity level to the extreme of the wick that swept it in pips. Measure on the same timeframe you identified the liquidity on"/></FL>
+                <NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/>
+              </div>
             </div>
           )}
 
           {/* S4 — Second Sweep (conditional, gates apply) */}
           {currentId === 'second_sweep' && (
             <div className="space-y-4">
-              <div><FL>Failed Continuation?</FL><YN val={entry.failed_continuation} onChg={v=>set('failed_continuation',v)}/></div>
+              <div>
+                <FL>Failed Continuation? <InfoTip content="After the first sweep did price attempt to continue in the original direction and fail? A failed continuation means price made a move toward the original target but could not sustain it. This gives the second sweep structural significance"/></FL>
+                <YN val={entry.failed_continuation} onChg={v=>set('failed_continuation',v)}/>
+              </div>
               {entry.failed_continuation === false && (
                 <div className="text-xs text-gray-700 border border-gray-800 rounded px-3 py-2.5">
                   Gate 1 not met — second sweep fields hidden (failed_continuation = No).
@@ -3136,24 +3333,74 @@ function BacktestLogTab() {
           {/* S5 — Displacement / Structure */}
           {currentId === 'displacement' && (
             <div className="space-y-4">
-              <div><FL>Displacement Confirmed?</FL><YN val={entry.displacement_confirmed} onChg={v=>set('displacement_confirmed',v)}/></div>
-              <div><FL>Displacement Quality</FL><TG opts={O.dispQ} val={entry.displacement_quality} onSel={v=>set('displacement_quality',v)} cols={3}/></div>
-              <div><FL>Displacement Body Ratio (%)</FL><NI val={entry.displacement_body_ratio} onChg={v=>set('displacement_body_ratio',v)} ph="e.g. 75"/></div>
-              <div><FL>Candle Close Position</FL><TG opts={O.candleP} val={entry.candle_close_position} onSel={v=>set('candle_close_position',v)} cols={3}/></div>
-              <div><FL>CHoCH or BOS Present?</FL><TG opts={O.chochBos} val={entry.choch_or_bos} onSel={v=>set('choch_or_bos',v)} cols={3}/></div>
-              <div><FL>Structure Confirmation</FL><TG opts={O.struct} val={entry.structure_confirmation} onSel={v=>set('structure_confirmation',v)} cols={3}/></div>
+              <div>
+                <div className={validationErrors.displacement_confirmed ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Displacement Confirmed?</FL>
+                  <YN val={entry.displacement_confirmed} onChg={v=>set('displacement_confirmed',v)}/>
+                </div>
+                {validationErrors.displacement_confirmed && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.displacement_quality ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Displacement Quality</FL>
+                  <TG opts={O.dispQ} val={entry.displacement_quality} onSel={v=>set('displacement_quality',v)} cols={3}/>
+                </div>
+                {validationErrors.displacement_quality && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <FL>Candle Close Position <InfoTip content="Where did the displacement candle close within its own range? Above 50% means it closed in the upper half. At H/L means it closed at the extreme which is maximum strength. Measure on M1"/></FL>
+                <TG opts={O.candleP} val={entry.candle_close_position} onSel={v=>set('candle_close_position',v)} cols={3}/>
+              </div>
+              <div>
+                <div className={validationErrors.choch_or_bos ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>CHoCH or BOS Present?</FL>
+                  <TG opts={O.chochBos} val={entry.choch_or_bos} onSel={v=>set('choch_or_bos',v)} cols={3}/>
+                </div>
+                {validationErrors.choch_or_bos && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.structure_confirmation ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Structure Confirmation</FL>
+                  <TG opts={O.struct} val={entry.structure_confirmation} onSel={v=>set('structure_confirmation',v)} cols={3}/>
+                </div>
+                {validationErrors.structure_confirmation && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
             </div>
           )}
 
           {/* S6 — POI / Inducement */}
           {currentId === 'poi' && (
             <div className="space-y-4">
-              <div><FL>POI Type</FL><TG opts={O.poiT} val={entry.poi_type} onSel={v=>set('poi_type',v)} cols={2}/></div>
+              <div>
+                <div className={validationErrors.poi_type ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>POI Type</FL>
+                  <TG opts={O.poiT} val={entry.poi_type} onSel={v=>set('poi_type',v)} cols={2}/>
+                </div>
+                {validationErrors.poi_type && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
               <div><FL>POI Size (pips)</FL><NI val={entry.poi_size_pips} onChg={v=>set('poi_size_pips',v)} ph="e.g. 15"/></div>
-              <div><FL>Inducement Confirmed?</FL><YN val={entry.inducement_confirmed} onChg={v=>set('inducement_confirmed',v)}/></div>
+              <div>
+                <div className={validationErrors.inducement_confirmed ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Inducement Confirmed?</FL>
+                  <YN val={entry.inducement_confirmed} onChg={v=>set('inducement_confirmed',v)}/>
+                </div>
+                {validationErrors.inducement_confirmed && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
               <div><FL>Inducement Type (multi)</FL><TG opts={O.indType} val={entry.inducement_type} onSel={v=>toggleArr('inducement_type',v)} multi cols={2}/></div>
-              <div><FL>LTF Confirmation</FL><TG opts={O.ltf} val={entry.ltf_confirmation} onSel={v=>set('ltf_confirmation',v)} cols={2}/></div>
-              <div><FL>Full Sequence Complete?</FL><YN val={entry.full_sequence_complete} onChg={v=>set('full_sequence_complete',v)}/></div>
+              <div>
+                <div className={validationErrors.ltf_confirmation ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>LTF Confirmation</FL>
+                  <TG opts={O.ltf} val={entry.ltf_confirmation} onSel={v=>set('ltf_confirmation',v)} cols={2}/>
+                </div>
+                {validationErrors.ltf_confirmation && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
+              <div>
+                <div className={validationErrors.full_sequence_complete ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Full Sequence Complete?</FL>
+                  <YN val={entry.full_sequence_complete} onChg={v=>set('full_sequence_complete',v)}/>
+                </div>
+                {validationErrors.full_sequence_complete && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
             </div>
           )}
 
@@ -3179,22 +3426,97 @@ function BacktestLogTab() {
           {/* S8 — Outcome */}
           {currentId === 'outcome' && (
             <div className="space-y-4">
-              <div><FL>Result</FL><TG opts={O.result} val={entry.result} onSel={v=>set('result',v)} cols={4}/></div>
+              <div>
+                <div className={validationErrors.result ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Result</FL>
+                  <TG opts={O.result} val={entry.result} onSel={v=>set('result',v)} cols={4}/>
+                </div>
+                {validationErrors.result && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
               <div><FL>R Achieved</FL><NI val={entry.r_achieved} onChg={v=>set('r_achieved',v)} ph="e.g. 6.5"/></div>
               <div><FL>Exit Reason</FL><TG opts={O.exit} val={entry.exit_reason} onSel={v=>set('exit_reason',v)} cols={4}/></div>
-              <div><FL>Trade Grade</FL><TG opts={O.grades} val={entry.trade_grade} onSel={v=>set('trade_grade',v)} cols={4}/></div>
+              <div>
+                <div className={validationErrors.trade_grade ? 'ring-1 ring-red-500 rounded' : ''}>
+                  <FL>Trade Grade</FL>
+                  <TG opts={O.grades} val={entry.trade_grade} onSel={v=>set('trade_grade',v)} cols={4}/>
+                </div>
+                {validationErrors.trade_grade && <div className="mt-1 text-xs text-red-500">Required</div>}
+              </div>
             </div>
           )}
 
           {/* S9 — Rules / Warnings */}
           {currentId === 'rules' && (
             <div className="space-y-4">
-              <div><FL>Rule Triggered (multi)</FL><TG opts={O.rules} val={entry.rule_triggered} onSel={v=>toggleArr('rule_triggered',v)} multi cols={3}/></div>
-              <div><FL>Warning Signal Present?</FL><YN val={entry.warning_signal_present} onChg={v=>set('warning_signal_present',v)}/></div>
+              {/* Rule Triggered */}
+              <div>
+                <FL>Rule Triggered</FL>
+                {/* No Rules Triggered button */}
+                <div className="mb-2">
+                  <button
+                    onClick={() => set('rule_triggered', entry.rule_triggered === 'NONE' ? [] : 'NONE')}
+                    className={`w-full py-2.5 rounded border text-xs cursor-pointer transition-colors font-bold ${
+                      entry.rule_triggered === 'NONE'
+                        ? 'border-green-600 bg-green-900/40 text-green-200 ring-1 ring-green-600 ring-inset'
+                        : 'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950'
+                    }`}>
+                    ✓ No Rules Triggered
+                  </button>
+                </div>
+                {/* Rule buttons grid */}
+                <div className="grid gap-1.5 grid-cols-3">
+                  {O.rules.map(([v, l]) => {
+                    const noRules = entry.rule_triggered === 'NONE';
+                    const active = Array.isArray(entry.rule_triggered) && entry.rule_triggered.includes(v);
+                    return (
+                      <button key={v}
+                        disabled={noRules}
+                        onClick={() => { if (noRules) return; toggleArr('rule_triggered', v); }}
+                        className={`relative py-3 px-2 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
+                          noRules ? 'border-gray-800 text-gray-800 bg-gray-950 cursor-not-allowed' :
+                          active  ? 'border-blue-500 bg-blue-900/60 text-blue-100 font-bold ring-1 ring-blue-500 ring-inset' :
+                                    'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950 hover:bg-gray-900'
+                        }`}>
+                        <span>{l}</span>
+                        <span className="absolute top-1 right-1"><InfoTip content={RULE_TIPS[v]} position="left"/></span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Warning Signal Present — 3 options: Yes / No / No Warning */}
+              <div>
+                <FL>Warning Signal Present?</FL>
+                <div className="flex gap-2">
+                  {[[true,'Yes'],[false,'No'],['none','No Warning']].map(([b, lbl]) => (
+                    <button key={String(b)} onClick={() => set('warning_signal_present', entry.warning_signal_present === b ? null : b)}
+                      className={`flex-1 py-3 rounded border text-xs cursor-pointer transition-colors ${
+                        entry.warning_signal_present === b
+                          ? b === true  ? 'border-green-500 bg-green-900/50 text-green-100 font-bold ring-1 ring-green-600 ring-inset'
+                          : b === false ? 'border-red-600 bg-red-900/40 text-red-100 font-bold ring-1 ring-red-700 ring-inset'
+                                        : 'border-gray-500 bg-gray-800 text-gray-200 font-bold ring-1 ring-gray-500 ring-inset'
+                          : 'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950'
+                      }`}>{lbl}</button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Warning Signal Acted On — only if warning_signal_present === true */}
               {entry.warning_signal_present === true && (
-                <div><FL>Warning Signal Acted On?</FL><YN val={entry.warning_signal_acted_on} onChg={v=>set('warning_signal_acted_on',v)}/></div>
+                <div>
+                  <FL>Warning Signal Acted On?</FL>
+                  <YN val={entry.warning_signal_acted_on} onChg={v=>set('warning_signal_acted_on',v)}/>
+                </div>
               )}
-              <div><FL>Failed At Stage (multi)</FL><TG opts={O.failSt} val={entry.failed_at_stage} onSel={v=>toggleArr('failed_at_stage',v)} multi cols={4}/></div>
+
+              {/* Failed At Stage — only if result is not Win */}
+              {entry.result && entry.result !== 'Win' && (
+                <div>
+                  <FL>Failed At Stage (multi)</FL>
+                  <TG opts={O.failSt} val={entry.failed_at_stage} onSel={v=>toggleArr('failed_at_stage',v)} multi cols={4}/>
+                </div>
+              )}
             </div>
           )}
 
@@ -3241,15 +3563,15 @@ function BacktestLogTab() {
           {currentId === 'summary' && (
             <div className="space-y-4">
               <div className={`flex items-center gap-3 border rounded p-3 ${liveBand.ring} bg-gray-950`}>
-                <span className={`font-bold text-3xl leading-none ${liveBand.color}`}>{liveSQS}</span>
+                <span className={`font-bold text-3xl leading-none ${liveBand.color}`}>{entry.liquidity_tier && entry.displacement_quality ? liveSQS : '—'}</span>
                 <div>
-                  <div className={`font-bold text-sm ${liveBand.color}`}>{liveBand.grade} — {liveBand.label}</div>
+                  <div className={`font-bold text-sm ${liveBand.color}`}>{entry.liquidity_tier && entry.displacement_quality ? liveBand.grade + ' — ' + liveBand.label : '—'}</div>
                   <div className="text-xs text-gray-600 mt-0.5">{entry.pair} {entry.direction} · {entry.date}</div>
                 </div>
                 <div className="ml-auto flex flex-col gap-1 items-end">
                   {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override Applied</span>}
                   {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
-                  {liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+                  {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
                 </div>
               </div>
               <div className="border border-gray-800 rounded p-3 space-y-0.5">
@@ -3267,8 +3589,12 @@ function BacktestLogTab() {
                 <SumRow label="Target RR" val={entry.target_rr?`${entry.target_rr}R`:null}/>
                 <SumRow label="Result" val={entry.result?`${entry.result}${entry.r_achieved?` · ${entry.r_achieved}R`:''}`:null}/>
                 <SumRow label="Trade Grade" val={entry.trade_grade}/>
-                <SumRow label="Rules Triggered" val={(entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):null}/>
-                <SumRow label="Warning Signal" val={entry.warning_signal_present===true?`Yes · Acted on: ${entry.warning_signal_acted_on===true?'Yes':entry.warning_signal_acted_on===false?'No':'—'}`:entry.warning_signal_present===false?'No':null}/>
+                <SumRow label="Rules Triggered" val={entry.rule_triggered === 'NONE' ? 'None' : (entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):null}/>
+                <SumRow label="Warning Signal" val={
+                  entry.warning_signal_present === true ? `Yes · Acted on: ${entry.warning_signal_acted_on===true?'Yes':entry.warning_signal_acted_on===false?'No':'—'}` :
+                  entry.warning_signal_present === false ? 'No' :
+                  entry.warning_signal_present === 'none' ? 'No Warning' : null
+                }/>
               </div>
               {saveState === 'error' && (
                 <div className="text-xs text-red-400 border border-red-800 bg-red-950/20 rounded px-3 py-2">❌ Save failed — check browser console.</div>
@@ -3297,7 +3623,15 @@ function BacktestLogTab() {
               </button>
             )}
             {currentId !== 'summary' && (
-              <button onClick={() => setStep(s => Math.min(totalSteps - 1, s + 1))}
+              <button onClick={() => {
+                const errs = validateStep(currentId);
+                if (Object.keys(errs).length > 0) {
+                  setValidationErrors(errs);
+                } else {
+                  setValidationErrors({});
+                  setStep(s => Math.min(totalSteps - 1, s + 1));
+                }
+              }}
                 className="flex-1 py-2.5 rounded border border-gray-600 bg-gray-900 hover:bg-gray-800 text-gray-200 text-xs font-bold cursor-pointer transition-colors">
                 Next →
               </button>
