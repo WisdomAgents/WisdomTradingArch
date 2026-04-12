@@ -2756,7 +2756,7 @@ const BL_EMPTY = {
   poi_type: '', poi_size_pips: '', inducement_confirmed: null, inducement_type: [],
   ltf_confirmation: '', full_sequence_complete: null,
   entry_price: '', stop_price: '', stop_distance_pips: '', target_rr: '', target_description: '',
-  result: '', r_achieved: '', exit_reason: '',
+  result: '', r_achieved: '', exit_reason: '', trade_grade: '',
   rule_triggered: [], warning_signal_present: null, warning_signal_acted_on: null, failed_at_stage: [],
   price_context: '', execution_notes: '', key_takeaway: '', chart_screenshot_url: '',
 };
@@ -2764,6 +2764,7 @@ const BL_EMPTY = {
 // ─── BacktestLogTab ───────────────────────────────────────────────────
 function BacktestLogTab() {
   const [entry, setEntryRaw]   = useState({ ...BL_EMPTY });
+  const [step,  setStep]       = useState(0);
   const [saveState, setSaveState]         = useState('idle'); // idle | saving | saved | error
   const [sqsScore,  setSqsScore]          = useState(null);
   const [confirmIncomplete, setConfirmIncomplete] = useState(false);
@@ -2774,12 +2775,28 @@ function BacktestLogTab() {
   const [cfTarget,    setCfTarget]        = useState(null);
   const [cfForm,      setCfForm]          = useState({ setup_played_out: null, counterfactual_r: '', decision_correct: null });
   const [cfSaving,    setCfSaving]        = useState(false);
+  const [imgUploading, setImgUploading]  = useState(false);
+  const [imgError,     setImgError]      = useState('');
 
   const set       = (k, v) => setEntryRaw(p => ({ ...p, [k]: v }));
   const toggleArr = (k, v) => setEntryRaw(p => {
     const a = Array.isArray(p[k]) ? p[k] : [];
     return { ...p, [k]: a.includes(v) ? a.filter(x => x !== v) : [...a, v] };
   });
+
+  // Chart screenshot upload to Supabase Storage
+  const handleImgUpload = async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImgUploading(true); setImgError('');
+    const ext  = file.name.split('.').pop();
+    const path = `charts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+    const { error: upErr } = await supabase.storage.from('chart-screenshots').upload(path, file, { upsert: false });
+    if (upErr) { setImgError('Upload failed: ' + upErr.message); setImgUploading(false); return; }
+    const { data } = supabase.storage.from('chart-screenshots').getPublicUrl(path);
+    set('chart_screenshot_url', data.publicUrl);
+    setImgUploading(false);
+  };
 
   // Auto-calc stop distance pips
   useEffect(() => {
@@ -2813,6 +2830,52 @@ function BacktestLogTab() {
   const liveSQS  = useMemo(() => calculateSQS(entry), [entry]);
   const liveBand = sqsBand(liveSQS);
 
+  // Dynamic steps (S4 only when sequence needs it)
+  const steps = useMemo(() => [
+    { id:'context',      label:'Context' },
+    { id:'sequence',     label:'Model / Sequence' },
+    { id:'primary_sweep',label:'Primary Sweep' },
+    ...(showS4 ? [{ id:'second_sweep', label:'Second Sweep' }] : []),
+    { id:'displacement', label:'Displacement' },
+    { id:'poi',          label:'POI / Inducement' },
+    { id:'entry',        label:'Entry Details' },
+    { id:'outcome',      label:'Outcome' },
+    { id:'rules',        label:'Rules / Warnings' },
+    { id:'notes',        label:'Notes' },
+    { id:'summary',      label:'Summary' },
+  ], [showS4]);
+
+  const totalSteps  = steps.length;
+  const currentStep = Math.min(step, totalSteps - 1);
+  const currentId   = steps[currentStep]?.id;
+
+  // One-line summary per completed step
+  const stepSummary = id => {
+    switch(id) {
+      case 'context':
+        return `${entry.pair||'—'} ${entry.direction||'—'} · ${entry.session||'—'} · HTF: ${entry.htf_bias||'—'}${entry.bias_aligned===true?' ✓ aligned':entry.bias_aligned===false?' ⚠ NOT aligned':''}`;
+      case 'sequence':
+        return `${entry.sequence_type||'—'} · ${(entry.model_type||[]).join(', ')||'—'} · ${entry.model_status||'—'}`;
+      case 'primary_sweep':
+        return `${entry.liquidity_tier||'—'} · ${entry.sweep_quality||'—'} sweep · ${entry.sweep_distance_pips||'—'}p`;
+      case 'second_sweep':
+        return `${entry.secondary_sweep_quality||'—'} sweep · ${entry.secondary_displacement_quality||'—'} disp${entry.second_sweep_override?' · ⚠ Override':''}`;
+      case 'displacement':
+        return `${entry.displacement_quality||'—'} · ${entry.structure_confirmation||'—'} · Body ${entry.displacement_body_ratio||'—'}%`;
+      case 'poi':
+        return `${entry.poi_type||'—'} POI · ${(entry.inducement_type||[]).join(', ')||'—'} · LTF: ${entry.ltf_confirmation||'—'} · Seq: ${entry.full_sequence_complete===true?'✓':entry.full_sequence_complete===false?'✗ incomplete':'—'}`;
+      case 'entry':
+        return `EP ${entry.entry_price||'—'} · SL ${entry.stop_price||'—'} (${entry.stop_distance_pips||'—'}p) · ${entry.target_rr||'—'}R`;
+      case 'outcome':
+        return `${entry.result||'—'} · ${entry.r_achieved||'—'}R · ${entry.exit_reason||'—'} · Grade: ${entry.trade_grade||'—'}`;
+      case 'rules':
+        return `Rules: ${(entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):'None'} · Warning: ${entry.warning_signal_present===true?'Yes':entry.warning_signal_present===false?'No':'—'}`;
+      case 'notes':
+        return entry.key_takeaway ? (entry.key_takeaway.length>55?entry.key_takeaway.slice(0,55)+'…':entry.key_takeaway) : '—';
+      default: return '—';
+    }
+  };
+
   // Save flow
   const handleSave = () => {
     if (entry.full_sequence_complete === false) { setConfirmIncomplete(true); return; }
@@ -2828,7 +2891,6 @@ function BacktestLogTab() {
     const payload = { ...entry };
     NUM.forEach(k => { const v = parseFloat(payload[k]); payload[k] = isNaN(v) ? null : v; });
     Object.keys(payload).forEach(k => { if (payload[k] === '') payload[k] = null; });
-    // Section 10 is second-pass only — not written on initial insert
     delete payload.setup_played_out; delete payload.counterfactual_r; delete payload.decision_correct;
     payload.sqs_score           = score;
     payload.grade               = band.grade;
@@ -2836,13 +2898,13 @@ function BacktestLogTab() {
     payload.enrichment_complete = true;
     const { error } = await supabase.from('backtest_logs').insert(payload);
     if (error) { setSaveState('error'); console.error('backtest_logs:', error); }
-    else       { setSaveState('saved'); setEntryRaw({ ...BL_EMPTY }); setOverrideApplied(false); loadRecentLogs(); }
+    else       { setSaveState('saved'); setEntryRaw({ ...BL_EMPTY }); setOverrideApplied(false); setStep(0); loadRecentLogs(); }
   };
 
   const loadRecentLogs = async () => {
     const { data } = await supabase
       .from('backtest_logs')
-      .select('id,date,pair,direction,sequence_type,sqs_score,grade,result,setup_played_out,enrichment_complete')
+      .select('id,date,pair,direction,sequence_type,sqs_score,grade,result,setup_played_out,enrichment_complete,bias_aligned,second_sweep_override,chart_screenshot_url')
       .order('evaluated_at', { ascending: false }).limit(20);
     if (data) setRecentLogs(data);
   };
@@ -2861,26 +2923,19 @@ function BacktestLogTab() {
     if (!error) { setCfTarget(null); loadRecentLogs(); }
   };
 
-  // ── Micro UI components (scoped to BacktestLogTab) ──────────────────
-  const BSH = ({ children, note }) => (
-    <div className="flex items-center gap-2 text-xs text-gray-600 uppercase tracking-widest border-b border-gray-800 pb-1.5 mb-3 mt-5 first:mt-0">
-      <span>{children}</span>
-      {note && <span className="text-gray-700 normal-case tracking-normal ml-1">{note}</span>}
-    </div>
-  );
-
+  // ── Micro UI (scoped) ───────────────────────────────────────────────
   const TG = ({ opts, val, onSel, multi = false, disabled: disabledFn, cols = 3 }) => (
-    <div className="grid gap-1" style={{ gridTemplateColumns:`repeat(${cols},minmax(0,1fr))` }}>
+    <div className="grid gap-1.5" style={{ gridTemplateColumns:`repeat(${cols},minmax(0,1fr))` }}>
       {opts.map(([v, l]) => {
         const dis    = disabledFn ? disabledFn(v) : false;
         const active = multi ? (Array.isArray(val) && val.includes(v)) : val === v;
         return (
           <button key={v} disabled={dis}
             onClick={() => { if(dis) return; multi ? onSel(v) : onSel(v === val ? '' : v); }}
-            className={`py-1.5 px-1 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
+            className={`py-3 px-2 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
               dis    ? 'border-gray-800 text-gray-800 bg-gray-950 cursor-not-allowed' :
-              active ? 'border-blue-600 bg-blue-950/40 text-blue-300' :
-                       'border-gray-700 text-gray-500 hover:border-gray-500 hover:text-gray-300 bg-gray-950'
+              active ? 'border-blue-500 bg-blue-900/60 text-blue-100 font-bold ring-1 ring-blue-500 ring-inset' :
+                       'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950 hover:bg-gray-900'
             }`}>{l || v}</button>
         );
       })}
@@ -2888,13 +2943,14 @@ function BacktestLogTab() {
   );
 
   const YN = ({ val, onChg, yes = 'Yes', no = 'No' }) => (
-    <div className="flex gap-1.5">
+    <div className="flex gap-2">
       {[[true, yes],[false, no]].map(([b, lbl]) => (
         <button key={String(b)} onClick={() => onChg(val === b ? null : b)}
-          className={`flex-1 py-1.5 rounded border text-xs cursor-pointer transition-colors ${
+          className={`flex-1 py-3 rounded border text-xs cursor-pointer transition-colors ${
             val === b
-              ? b ? 'border-green-700 bg-green-950/30 text-green-400' : 'border-red-800 bg-red-950/20 text-red-400'
-              : 'border-gray-700 text-gray-500 hover:border-gray-500'
+              ? b ? 'border-green-500 bg-green-900/50 text-green-100 font-bold ring-1 ring-green-600 ring-inset'
+                  : 'border-red-600 bg-red-900/40 text-red-100 font-bold ring-1 ring-red-700 ring-inset'
+              : 'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950'
           }`}>{lbl}</button>
       ))}
     </div>
@@ -2902,18 +2958,25 @@ function BacktestLogTab() {
 
   const NI = ({ val, onChg, ph }) => (
     <input type="number" inputMode="decimal" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
-      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700"/>
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2.5 rounded focus:outline-none focus:border-gray-500 placeholder-gray-700"/>
   );
 
   const TxtIn = ({ val, onChg, ph }) => (
     <input type="text" value={val} onChange={e => onChg(e.target.value)} placeholder={ph}
-      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700"/>
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2.5 rounded focus:outline-none focus:border-gray-500 placeholder-gray-700"/>
   );
 
   const TA2 = ({ val, onChg, ph, rows = 2 }) => (
     <textarea value={val} onChange={e => onChg(e.target.value)} placeholder={ph} rows={rows}
-      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none placeholder-gray-700 resize-none"/>
+      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none focus:border-gray-500 placeholder-gray-700 resize-none"/>
   );
+
+  const SumRow = ({ label, val }) => val ? (
+    <div className="flex gap-2 text-xs py-0.5">
+      <span className="text-gray-700 w-36 flex-shrink-0">{label}</span>
+      <span className="text-gray-300">{String(val)}</span>
+    </div>
+  ) : null;
 
   // Option lists
   const O = {
@@ -2936,91 +2999,121 @@ function BacktestLogTab() {
     poiT:     [['HTF','HTF'],['LTF','LTF']],
     result:   [['Win','Win'],['Loss','Loss'],['Break Even','BE'],['No Trade','No Trade']],
     exit:     [['Target Hit','Target Hit'],['Stop Hit','Stop Hit'],['Manual Close','Manual'],['Break Even','BE']],
+    grades:   [['A+','A+'],['A','A'],['B','B'],['No Trade','No Trade']],
     rules:    [['Daily Loss Limit','Daily Limit'],['Over-Trading','Over-Trade'],['Revenge Trade','Revenge'],['FOMO Entry','FOMO'],['Wrong Session','Bad Session'],['Bias Ignored','Bias Ignored'],['No Inducement','No Induce'],['Premature Entry','Premature']],
     failSt:   [['POI','POI'],['Time','Time'],['Liquidity','Liquidity'],['Inducement','Induce'],['Displacement','Disp'],['Failure Model','Fail Model'],['BOS','BOS'],['RIFC','RIFC']],
   };
 
   return (
-    <div className="max-w-2xl mx-auto space-y-3 pb-16">
+    <div className="max-w-2xl mx-auto pb-16">
 
-      {/* ── Live SQS badge ──────────────────────────────────────── */}
-      <div className={`flex items-center justify-between bg-gray-950 border rounded-sm px-4 py-2.5 ${liveBand.ring}`}>
-        <div className="flex items-center gap-2">
+      {/* ── Pinned SQS bar ─────────────────────────────────────────── */}
+      <div className={`sticky top-0 z-30 flex items-center justify-between bg-gray-950/95 backdrop-blur border-b ${liveBand.ring} px-4 py-2.5`}>
+        <div className="flex items-center gap-2.5">
           <span className="text-gray-600 text-xs uppercase tracking-widest">SQS</span>
-          <span className={`font-bold text-2xl ${liveBand.color}`}>{liveSQS}</span>
-          <span className={`font-bold text-xs ml-1 ${liveBand.color}`}>{liveBand.grade}</span>
+          <span className={`font-bold text-xl ${liveBand.color}`}>{liveSQS}</span>
+          <span className={`text-xs font-bold ${liveBand.color}`}>{liveBand.grade}</span>
+          <span className="text-gray-700 mx-0.5">—</span>
+          <span className={`text-xs ${liveBand.color}`}>{liveBand.label}</span>
         </div>
-        <span className={`text-xs ${liveBand.color}`}>{liveBand.label}</span>
-        {overrideApplied && (
-          <span className="text-xs text-orange-400 border border-orange-700 bg-orange-950/20 rounded px-2 py-0.5 ml-2">⚠ Override −8</span>
-        )}
+        <div className="flex items-center gap-1.5 flex-wrap justify-end">
+          {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override −8</span>}
+          {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
+          {liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+        </div>
       </div>
 
-      {/* Bias warning */}
-      {entry.bias_aligned === false && (
-        <div className="border border-yellow-700 bg-yellow-950/20 rounded-sm px-3 py-2 text-xs text-yellow-400">
-          ⚠️ HTF Bias NOT aligned — entry goes against higher timeframe direction. This flag persists on the logged entry.
+      {/* ── Progress bar ───────────────────────────────────────────── */}
+      <div className="px-4 pt-3 pb-1 flex items-center gap-1">
+        {steps.map((s, i) => (
+          <div key={s.id} className={`h-1.5 rounded-full transition-all duration-300 ${
+            i < currentStep  ? 'flex-1 bg-green-700' :
+            i === currentStep ? 'flex-[2] bg-blue-500' :
+                                'flex-1 bg-gray-800'
+          }`}/>
+        ))}
+        <span className="text-xs text-gray-600 ml-2 flex-shrink-0">{currentStep + 1} / {totalSteps}</span>
+      </div>
+      <div className="px-4 pb-2">
+        <span className="text-xs text-gray-500">{steps[currentStep]?.label}</span>
+      </div>
+
+      {/* ── Completed step summaries (clickable to edit) ────────────── */}
+      {currentStep > 0 && (
+        <div className="px-4 mb-3 space-y-1">
+          {steps.slice(0, currentStep).map((s, i) => (
+            <button key={s.id} onClick={() => setStep(i)}
+              className="w-full flex items-center gap-2 px-3 py-2 bg-gray-950 border border-gray-800 rounded text-xs hover:border-gray-700 cursor-pointer text-left group">
+              <span className="text-green-700 flex-shrink-0">✓</span>
+              <span className="text-gray-700 font-bold flex-shrink-0 w-4 text-center">{i+1}</span>
+              <span className="text-gray-600 flex-shrink-0">{s.label}</span>
+              <span className="text-gray-700 mx-1">·</span>
+              <span className="text-gray-400 truncate">{stepSummary(s.id)}</span>
+              <span className="ml-auto text-gray-800 text-xs group-hover:text-gray-600 flex-shrink-0">edit</span>
+            </button>
+          ))}
         </div>
       )}
 
-      {/* Auto NO TRADE warning */}
-      {liveSQS < 40 && liveSQS > 0 && (
-        <div className="border border-red-800 bg-red-950/20 rounded-sm px-3 py-2 text-xs text-red-400">
-          🔴 SQS below 40 — Auto NO TRADE threshold. Entry will be flagged on save.
-        </div>
-      )}
-
-      <Panel>
-        {/* ── S1 Context ──────────────────────────────────────── */}
-        <BSH>1 — Context</BSH>
-        <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <FL>Date</FL>
-              <input type="date" value={entry.date} onChange={e=>set('date',e.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none"/>
-            </div>
-            <div><FL>Pair</FL><TG opts={O.pairs} val={entry.pair} onSel={v=>set('pair',v)} cols={2}/></div>
+      {/* ── Active step panel ──────────────────────────────────────── */}
+      <div className="px-4">
+        <Panel>
+          <div className="flex items-center justify-between text-xs text-gray-600 uppercase tracking-widest border-b border-gray-800 pb-2 mb-4">
+            <span>{currentStep + 1} — {steps[currentStep]?.label}</span>
+            <span className="text-gray-800 normal-case tracking-normal">step {currentStep + 1} of {totalSteps}</span>
           </div>
-          <div><FL>Direction</FL><TG opts={O.dir} val={entry.direction} onSel={v=>set('direction',v)} cols={2}/></div>
-          <div><FL>Session</FL><TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={3}/></div>
-          <div><FL>HTF Bias</FL><TG opts={O.bias} val={entry.htf_bias} onSel={v=>set('htf_bias',v)} cols={3}/></div>
-          <div><FL>Bias Aligned?</FL><YN val={entry.bias_aligned} onChg={v=>set('bias_aligned',v)}/></div>
-        </div>
 
-        {/* ── S2 Model / Sequence ─────────────────────────────── */}
-        <BSH>2 — Model / Sequence</BSH>
-        <div className="space-y-3">
-          <div><FL>Model Type (multi)</FL><TG opts={O.models} val={entry.model_type} onSel={v=>toggleArr('model_type',v)} multi cols={3}/></div>
-          <div><FL>Model Status</FL><TG opts={O.mstatus} val={entry.model_status} onSel={v=>set('model_status',v)} cols={3}/></div>
-          <div><FL>Sequence Type</FL><TG opts={O.seqTypes} val={entry.sequence_type} onSel={v=>set('sequence_type',v)} cols={2}/></div>
-        </div>
+          {/* S1 — Context */}
+          {currentId === 'context' && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <FL>Date</FL>
+                  <input type="date" value={entry.date} onChange={e=>set('date',e.target.value)}
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2.5 rounded focus:outline-none focus:border-gray-500"/>
+                </div>
+                <div><FL>Pair</FL><TG opts={O.pairs} val={entry.pair} onSel={v=>set('pair',v)} cols={2}/></div>
+              </div>
+              <div><FL>Direction</FL><TG opts={O.dir} val={entry.direction} onSel={v=>set('direction',v)} cols={2}/></div>
+              <div><FL>Session</FL><TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={3}/></div>
+              <div><FL>HTF Bias</FL><TG opts={O.bias} val={entry.htf_bias} onSel={v=>set('htf_bias',v)} cols={3}/></div>
+              <div><FL>Bias Aligned?</FL><YN val={entry.bias_aligned} onChg={v=>set('bias_aligned',v)}/></div>
+            </div>
+          )}
 
-        {/* ── S3 Primary Sweep ────────────────────────────────── */}
-        <BSH>3 — Primary Sweep</BSH>
-        <div className="space-y-3">
-          <div><FL>Liquidity Tier</FL><TG opts={O.tiers} val={entry.liquidity_tier} onSel={v=>set('liquidity_tier',v)} cols={3}/></div>
-          <div><FL>Liquidity Type (multi)</FL><TG opts={O.liqType} val={entry.liquidity_type} onSel={v=>toggleArr('liquidity_type',v)} multi cols={3}/></div>
-          <div><FL>Sweep Quality</FL><TG opts={O.sweepQ} val={entry.sweep_quality} onSel={v=>set('sweep_quality',v)} cols={3}/></div>
-          <div><FL>Sweep Distance (pips)</FL><NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/></div>
-        </div>
+          {/* S2 — Model / Sequence */}
+          {currentId === 'sequence' && (
+            <div className="space-y-4">
+              <div><FL>Model Type (multi)</FL><TG opts={O.models} val={entry.model_type} onSel={v=>toggleArr('model_type',v)} multi cols={3}/></div>
+              <div><FL>Model Status</FL><TG opts={O.mstatus} val={entry.model_status} onSel={v=>set('model_status',v)} cols={3}/></div>
+              <div><FL>Sequence Type</FL><TG opts={O.seqTypes} val={entry.sequence_type} onSel={v=>set('sequence_type',v)} cols={2}/></div>
+            </div>
+          )}
 
-        {/* ── S4 Second Sweep (conditional) ───────────────────── */}
-        {showS4 && (
-          <>
-            <BSH note="— gates apply">4 — Second Sweep</BSH>
-            <div className="space-y-3">
+          {/* S3 — Primary Sweep */}
+          {currentId === 'primary_sweep' && (
+            <div className="space-y-4">
+              <div><FL>Liquidity Tier</FL><TG opts={O.tiers} val={entry.liquidity_tier} onSel={v=>set('liquidity_tier',v)} cols={3}/></div>
+              <div><FL>Liquidity Type (multi)</FL><TG opts={O.liqType} val={entry.liquidity_type} onSel={v=>toggleArr('liquidity_type',v)} multi cols={3}/></div>
+              <div><FL>Sweep Quality</FL><TG opts={O.sweepQ} val={entry.sweep_quality} onSel={v=>set('sweep_quality',v)} cols={3}/></div>
+              <div><FL>Sweep Distance (pips)</FL><NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/></div>
+            </div>
+          )}
+
+          {/* S4 — Second Sweep (conditional, gates apply) */}
+          {currentId === 'second_sweep' && (
+            <div className="space-y-4">
               <div><FL>Failed Continuation?</FL><YN val={entry.failed_continuation} onChg={v=>set('failed_continuation',v)}/></div>
               {entry.failed_continuation === false && (
-                <div className="text-xs text-gray-700 border border-gray-800 rounded px-3 py-2">
-                  Gate 1 not met — Section 4 fields hidden (failed_continuation = No).
+                <div className="text-xs text-gray-700 border border-gray-800 rounded px-3 py-2.5">
+                  Gate 1 not met — second sweep fields hidden (failed_continuation = No).
                 </div>
               )}
               {s4Unlocked && (
-                <div className="space-y-3 border-l-2 border-gray-800 pl-3 ml-1">
+                <div className="space-y-4 border-l-2 border-gray-800 pl-3 ml-1">
                   <div>
                     <FL>Secondary Liquidity Tier</FL>
-                    <div className="text-xs text-gray-700 mb-1.5">Second sweep must match or exceed primary tier. Lower tiers are greyed out.</div>
+                    <div className="text-xs text-gray-700 mb-2">Second sweep must match or exceed primary tier. Lower tiers are greyed out.</div>
                     <TG opts={O.tiers} val={entry.secondary_liquidity_tier} onSel={v=>set('secondary_liquidity_tier',v)}
                       disabled={v => (BL_TIER_RANK[v]||0) < primTierRank} cols={3}/>
                   </div>
@@ -3030,7 +3123,7 @@ function BacktestLogTab() {
                     <FL>Secondary Displacement Quality</FL>
                     <TG opts={O.dispQ} val={entry.secondary_displacement_quality} onSel={handleSecDisp} cols={3}/>
                     {overrideApplied && (
-                      <div className="mt-1.5 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-1.5">
+                      <div className="mt-2 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2.5 py-2">
                         ⚠ Override Applied — secondary weaker than primary. SQS −8 penalty active. Cannot be waived.
                       </div>
                     )}
@@ -3038,96 +3131,180 @@ function BacktestLogTab() {
                 </div>
               )}
             </div>
-          </>
-        )}
+          )}
 
-        {/* ── S5 Displacement / Structure ─────────────────────── */}
-        <BSH>5 — Displacement / Structure</BSH>
-        <div className="space-y-3">
-          <div><FL>Displacement Confirmed?</FL><YN val={entry.displacement_confirmed} onChg={v=>set('displacement_confirmed',v)}/></div>
-          <div><FL>Displacement Quality</FL><TG opts={O.dispQ} val={entry.displacement_quality} onSel={v=>set('displacement_quality',v)} cols={3}/></div>
-          <div><FL>Displacement Body Ratio (%)</FL><NI val={entry.displacement_body_ratio} onChg={v=>set('displacement_body_ratio',v)} ph="e.g. 75"/></div>
-          <div><FL>Candle Close Position</FL><TG opts={O.candleP} val={entry.candle_close_position} onSel={v=>set('candle_close_position',v)} cols={3}/></div>
-          <div><FL>CHoCH or BOS Present?</FL><TG opts={O.chochBos} val={entry.choch_or_bos} onSel={v=>set('choch_or_bos',v)} cols={3}/></div>
-          <div><FL>Structure Confirmation</FL><TG opts={O.struct} val={entry.structure_confirmation} onSel={v=>set('structure_confirmation',v)} cols={3}/></div>
-        </div>
-
-        {/* ── S6 POI / Inducement ─────────────────────────────── */}
-        <BSH>6 — POI / Inducement</BSH>
-        <div className="space-y-3">
-          <div><FL>POI Type</FL><TG opts={O.poiT} val={entry.poi_type} onSel={v=>set('poi_type',v)} cols={2}/></div>
-          <div><FL>POI Size (pips)</FL><NI val={entry.poi_size_pips} onChg={v=>set('poi_size_pips',v)} ph="e.g. 15"/></div>
-          <div><FL>Inducement Confirmed?</FL><YN val={entry.inducement_confirmed} onChg={v=>set('inducement_confirmed',v)}/></div>
-          <div><FL>Inducement Type (multi)</FL><TG opts={O.indType} val={entry.inducement_type} onSel={v=>toggleArr('inducement_type',v)} multi cols={2}/></div>
-          <div><FL>LTF Confirmation</FL><TG opts={O.ltf} val={entry.ltf_confirmation} onSel={v=>set('ltf_confirmation',v)} cols={2}/></div>
-          <div><FL>Full Sequence Complete?</FL><YN val={entry.full_sequence_complete} onChg={v=>set('full_sequence_complete',v)}/></div>
-        </div>
-
-        {/* ── S7 Entry Details ────────────────────────────────── */}
-        <BSH>7 — Entry Details</BSH>
-        <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div><FL>Entry Price</FL><NI val={entry.entry_price} onChg={v=>set('entry_price',v)} ph="1.08450"/></div>
-            <div><FL>Stop Price</FL><NI val={entry.stop_price} onChg={v=>set('stop_price',v)} ph="1.08320"/></div>
-          </div>
-          {entry.stop_distance_pips && (
-            <div className="text-xs text-blue-400 border border-blue-900 bg-blue-950/20 rounded px-3 py-1.5">
-              Stop Distance: <span className="font-bold">{entry.stop_distance_pips}p</span> <span className="text-gray-600">(auto-calculated)</span>
+          {/* S5 — Displacement / Structure */}
+          {currentId === 'displacement' && (
+            <div className="space-y-4">
+              <div><FL>Displacement Confirmed?</FL><YN val={entry.displacement_confirmed} onChg={v=>set('displacement_confirmed',v)}/></div>
+              <div><FL>Displacement Quality</FL><TG opts={O.dispQ} val={entry.displacement_quality} onSel={v=>set('displacement_quality',v)} cols={3}/></div>
+              <div><FL>Displacement Body Ratio (%)</FL><NI val={entry.displacement_body_ratio} onChg={v=>set('displacement_body_ratio',v)} ph="e.g. 75"/></div>
+              <div><FL>Candle Close Position</FL><TG opts={O.candleP} val={entry.candle_close_position} onSel={v=>set('candle_close_position',v)} cols={3}/></div>
+              <div><FL>CHoCH or BOS Present?</FL><TG opts={O.chochBos} val={entry.choch_or_bos} onSel={v=>set('choch_or_bos',v)} cols={3}/></div>
+              <div><FL>Structure Confirmation</FL><TG opts={O.struct} val={entry.structure_confirmation} onSel={v=>set('structure_confirmation',v)} cols={3}/></div>
             </div>
           )}
-          <div className="grid grid-cols-2 gap-3">
-            <div><FL>Target RR</FL><NI val={entry.target_rr} onChg={v=>set('target_rr',v)} ph="e.g. 5"/></div>
-            <div><FL>Target Description</FL><TxtIn val={entry.target_description} onChg={v=>set('target_description',v)} ph="e.g. LDL at 1.0900"/></div>
-          </div>
-        </div>
 
-        {/* ── S8 Outcome ──────────────────────────────────────── */}
-        <BSH>8 — Outcome</BSH>
-        <div className="space-y-3">
-          <div><FL>Result</FL><TG opts={O.result} val={entry.result} onSel={v=>set('result',v)} cols={4}/></div>
-          <div><FL>R Achieved</FL><NI val={entry.r_achieved} onChg={v=>set('r_achieved',v)} ph="e.g. 6.5"/></div>
-          <div><FL>Exit Reason</FL><TG opts={O.exit} val={entry.exit_reason} onSel={v=>set('exit_reason',v)} cols={4}/></div>
-        </div>
-
-        {/* ── S9 Rules / Warnings ─────────────────────────────── */}
-        <BSH>9 — Rules / Warnings</BSH>
-        <div className="space-y-3">
-          <div><FL>Rule Triggered (multi)</FL><TG opts={O.rules} val={entry.rule_triggered} onSel={v=>toggleArr('rule_triggered',v)} multi cols={3}/></div>
-          <div><FL>Warning Signal Present?</FL><YN val={entry.warning_signal_present} onChg={v=>set('warning_signal_present',v)}/></div>
-          {entry.warning_signal_present && (
-            <div><FL>Warning Signal Acted On?</FL><YN val={entry.warning_signal_acted_on} onChg={v=>set('warning_signal_acted_on',v)}/></div>
-          )}
-          <div><FL>Failed At Stage (multi)</FL><TG opts={O.failSt} val={entry.failed_at_stage} onSel={v=>toggleArr('failed_at_stage',v)} multi cols={4}/></div>
-        </div>
-
-        {/* ── S11 Notes (S10 is second-pass) ──────────────────── */}
-        <BSH note="— Section 10 (Counterfactual) added after trade plays out">11 — Notes</BSH>
-        <div className="space-y-3">
-          <div><FL>Price Context</FL><TA2 val={entry.price_context} onChg={v=>set('price_context',v)} ph="Where was price? What was the macro context?"/></div>
-          <div><FL>Execution Notes</FL><TA2 val={entry.execution_notes} onChg={v=>set('execution_notes',v)} ph="How did you enter? Any hesitation?"/></div>
-          <div><FL>Key Takeaway</FL><TA2 val={entry.key_takeaway} onChg={v=>set('key_takeaway',v)} ph="What did this trade teach you?"/></div>
-          <div><FL>Chart Screenshot URL</FL><TxtIn val={entry.chart_screenshot_url} onChg={v=>set('chart_screenshot_url',v)} ph="https://…"/></div>
-        </div>
-
-        {/* ── Save ────────────────────────────────────────────── */}
-        <div className="mt-5 pt-4 border-t border-gray-800 space-y-2">
-          {saveState === 'error' && (
-            <div className="text-xs text-red-400 border border-red-800 bg-red-950/20 rounded px-3 py-2">❌ Save failed — check browser console for details.</div>
-          )}
-          {saveState === 'saved' && (
-            <div className="text-xs text-green-400 border border-green-800 bg-green-950/20 rounded px-3 py-2">
-              ✓ Logged — SQS {sqsScore} ({sqsBand(sqsScore).grade}). Add counterfactual (Section 10) below once the trade plays out.
+          {/* S6 — POI / Inducement */}
+          {currentId === 'poi' && (
+            <div className="space-y-4">
+              <div><FL>POI Type</FL><TG opts={O.poiT} val={entry.poi_type} onSel={v=>set('poi_type',v)} cols={2}/></div>
+              <div><FL>POI Size (pips)</FL><NI val={entry.poi_size_pips} onChg={v=>set('poi_size_pips',v)} ph="e.g. 15"/></div>
+              <div><FL>Inducement Confirmed?</FL><YN val={entry.inducement_confirmed} onChg={v=>set('inducement_confirmed',v)}/></div>
+              <div><FL>Inducement Type (multi)</FL><TG opts={O.indType} val={entry.inducement_type} onSel={v=>toggleArr('inducement_type',v)} multi cols={2}/></div>
+              <div><FL>LTF Confirmation</FL><TG opts={O.ltf} val={entry.ltf_confirmation} onSel={v=>set('ltf_confirmation',v)} cols={2}/></div>
+              <div><FL>Full Sequence Complete?</FL><YN val={entry.full_sequence_complete} onChg={v=>set('full_sequence_complete',v)}/></div>
             </div>
           )}
-          <button onClick={handleSave} disabled={saveState === 'saving'}
-            className={`w-full py-2 rounded border text-xs uppercase tracking-widest cursor-pointer transition-colors ${
-              saveState === 'saving' ? 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed' :
-              'bg-blue-950/20 hover:bg-blue-950/40 border-blue-700 text-blue-400'
-            }`}>
-            {saveState === 'saving' ? 'Saving…' : '+ Log Backtest Entry'}
-          </button>
-        </div>
-      </Panel>
+
+          {/* S7 — Entry Details */}
+          {currentId === 'entry' && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div><FL>Entry Price</FL><NI val={entry.entry_price} onChg={v=>set('entry_price',v)} ph="1.08450"/></div>
+                <div><FL>Stop Price</FL><NI val={entry.stop_price} onChg={v=>set('stop_price',v)} ph="1.08320"/></div>
+              </div>
+              {entry.stop_distance_pips && (
+                <div className="text-xs text-blue-400 border border-blue-900 bg-blue-950/20 rounded px-3 py-2">
+                  Stop Distance: <span className="font-bold">{entry.stop_distance_pips}p</span> <span className="text-gray-600">(auto-calculated)</span>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div><FL>Target RR</FL><NI val={entry.target_rr} onChg={v=>set('target_rr',v)} ph="e.g. 5"/></div>
+                <div><FL>Target Description</FL><TxtIn val={entry.target_description} onChg={v=>set('target_description',v)} ph="e.g. LDL at 1.09"/></div>
+              </div>
+            </div>
+          )}
+
+          {/* S8 — Outcome */}
+          {currentId === 'outcome' && (
+            <div className="space-y-4">
+              <div><FL>Result</FL><TG opts={O.result} val={entry.result} onSel={v=>set('result',v)} cols={4}/></div>
+              <div><FL>R Achieved</FL><NI val={entry.r_achieved} onChg={v=>set('r_achieved',v)} ph="e.g. 6.5"/></div>
+              <div><FL>Exit Reason</FL><TG opts={O.exit} val={entry.exit_reason} onSel={v=>set('exit_reason',v)} cols={4}/></div>
+              <div><FL>Trade Grade</FL><TG opts={O.grades} val={entry.trade_grade} onSel={v=>set('trade_grade',v)} cols={4}/></div>
+            </div>
+          )}
+
+          {/* S9 — Rules / Warnings */}
+          {currentId === 'rules' && (
+            <div className="space-y-4">
+              <div><FL>Rule Triggered (multi)</FL><TG opts={O.rules} val={entry.rule_triggered} onSel={v=>toggleArr('rule_triggered',v)} multi cols={3}/></div>
+              <div><FL>Warning Signal Present?</FL><YN val={entry.warning_signal_present} onChg={v=>set('warning_signal_present',v)}/></div>
+              {entry.warning_signal_present === true && (
+                <div><FL>Warning Signal Acted On?</FL><YN val={entry.warning_signal_acted_on} onChg={v=>set('warning_signal_acted_on',v)}/></div>
+              )}
+              <div><FL>Failed At Stage (multi)</FL><TG opts={O.failSt} val={entry.failed_at_stage} onSel={v=>toggleArr('failed_at_stage',v)} multi cols={4}/></div>
+            </div>
+          )}
+
+          {/* S10 — Notes (S10 counterfactual added second-pass) */}
+          {currentId === 'notes' && (
+            <div className="space-y-4">
+              <div className="text-xs text-gray-700 border border-gray-800 rounded px-3 py-2">Section 10 — Counterfactual is added after the trade plays out from the logs panel below.</div>
+              <div><FL>Price Context</FL><TA2 val={entry.price_context} onChg={v=>set('price_context',v)} ph="Where was price? What was the macro context?"/></div>
+              <div><FL>Execution Notes</FL><TA2 val={entry.execution_notes} onChg={v=>set('execution_notes',v)} ph="How did you enter? Any hesitation?"/></div>
+              <div><FL>Key Takeaway</FL><TA2 val={entry.key_takeaway} onChg={v=>set('key_takeaway',v)} ph="What did this trade teach you?"/></div>
+              <div>
+                <FL>Chart Screenshot</FL>
+                {entry.chart_screenshot_url ? (
+                  <div className="space-y-2">
+                    <img src={entry.chart_screenshot_url} alt="chart screenshot"
+                      className="rounded border border-gray-800 max-h-48 object-contain w-full bg-gray-950 cursor-pointer"
+                      onClick={() => window.open(entry.chart_screenshot_url, '_blank')}/>
+                    <button onClick={() => { set('chart_screenshot_url', ''); setImgError(''); }}
+                      className="text-xs text-gray-600 hover:text-red-400 border border-gray-800 rounded px-2 py-1 cursor-pointer transition-colors">
+                      ✕ Remove
+                    </button>
+                  </div>
+                ) : (
+                  <label className={`flex flex-col items-center justify-center w-full border border-dashed rounded py-6 cursor-pointer transition-colors ${
+                    imgUploading ? 'border-gray-700 bg-gray-950' : 'border-gray-700 bg-gray-950 hover:border-gray-500 hover:bg-gray-900'
+                  }`}>
+                    <input type="file" accept="image/*" className="hidden" onChange={handleImgUpload} disabled={imgUploading}/>
+                    {imgUploading
+                      ? <span className="text-xs text-gray-500">Uploading…</span>
+                      : <>
+                          <span className="text-2xl mb-1">📷</span>
+                          <span className="text-xs text-gray-500">Tap to upload chart screenshot</span>
+                          <span className="text-xs text-gray-700 mt-0.5">PNG, JPG, WEBP</span>
+                        </>
+                    }
+                  </label>
+                )}
+                {imgError && <div className="mt-1 text-xs text-red-400">{imgError}</div>}
+              </div>
+            </div>
+          )}
+
+          {/* Summary — full review before logging */}
+          {currentId === 'summary' && (
+            <div className="space-y-4">
+              <div className={`flex items-center gap-3 border rounded p-3 ${liveBand.ring} bg-gray-950`}>
+                <span className={`font-bold text-3xl leading-none ${liveBand.color}`}>{liveSQS}</span>
+                <div>
+                  <div className={`font-bold text-sm ${liveBand.color}`}>{liveBand.grade} — {liveBand.label}</div>
+                  <div className="text-xs text-gray-600 mt-0.5">{entry.pair} {entry.direction} · {entry.date}</div>
+                </div>
+                <div className="ml-auto flex flex-col gap-1 items-end">
+                  {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override Applied</span>}
+                  {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
+                  {liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+                </div>
+              </div>
+              <div className="border border-gray-800 rounded p-3 space-y-0.5">
+                <SumRow label="Pair / Direction" val={`${entry.pair} ${entry.direction}`}/>
+                <SumRow label="Date / Session" val={`${entry.date} · ${entry.session}`}/>
+                <SumRow label="Sequence" val={entry.sequence_type}/>
+                <SumRow label="Model" val={(entry.model_type||[]).join(', ')}/>
+                <SumRow label="Liquidity Tier" val={entry.liquidity_tier}/>
+                <SumRow label="Sweep Quality" val={entry.sweep_quality}/>
+                <SumRow label="Displacement" val={entry.displacement_quality ? `${entry.displacement_quality} · ${entry.structure_confirmation}` : null}/>
+                <SumRow label="Inducement" val={(entry.inducement_type||[]).join(', ')||null}/>
+                <SumRow label="LTF Confirm" val={entry.ltf_confirmation}/>
+                <SumRow label="Seq Complete" val={entry.full_sequence_complete===true?'✓ Yes':entry.full_sequence_complete===false?'✗ No':null}/>
+                <SumRow label="Entry / Stop" val={entry.entry_price?`${entry.entry_price} → ${entry.stop_price} (${entry.stop_distance_pips}p)`:null}/>
+                <SumRow label="Target RR" val={entry.target_rr?`${entry.target_rr}R`:null}/>
+                <SumRow label="Result" val={entry.result?`${entry.result}${entry.r_achieved?` · ${entry.r_achieved}R`:''}`:null}/>
+                <SumRow label="Trade Grade" val={entry.trade_grade}/>
+                <SumRow label="Rules Triggered" val={(entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):null}/>
+                <SumRow label="Warning Signal" val={entry.warning_signal_present===true?`Yes · Acted on: ${entry.warning_signal_acted_on===true?'Yes':entry.warning_signal_acted_on===false?'No':'—'}`:entry.warning_signal_present===false?'No':null}/>
+              </div>
+              {saveState === 'error' && (
+                <div className="text-xs text-red-400 border border-red-800 bg-red-950/20 rounded px-3 py-2">❌ Save failed — check browser console.</div>
+              )}
+              {saveState === 'saved' && (
+                <div className="text-xs text-green-400 border border-green-800 bg-green-950/20 rounded px-3 py-2">
+                  ✓ Logged — SQS {sqsScore} ({sqsScore != null ? sqsBand(sqsScore).grade : '—'}). Add counterfactual below once the trade plays out.
+                </div>
+              )}
+              <button onClick={handleSave} disabled={saveState === 'saving'}
+                className={`w-full py-3 rounded border text-xs font-bold uppercase tracking-widest cursor-pointer transition-colors ${
+                  saveState === 'saving' ? 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed' :
+                  'bg-blue-950/30 hover:bg-blue-950/60 border-blue-600 text-blue-300'
+                }`}>
+                {saveState === 'saving' ? 'Saving…' : '📓 LOG BACKTEST ENTRY'}
+              </button>
+            </div>
+          )}
+
+          {/* ── Navigation ─────────────────────────────────────────── */}
+          <div className="flex gap-2 mt-6 pt-4 border-t border-gray-800">
+            {currentStep > 0 && (
+              <button onClick={() => setStep(s => Math.max(0, s - 1))}
+                className="px-5 py-2.5 rounded border border-gray-700 text-gray-400 text-xs cursor-pointer hover:border-gray-500 hover:text-gray-200 transition-colors">
+                ← Back
+              </button>
+            )}
+            {currentId !== 'summary' && (
+              <button onClick={() => setStep(s => Math.min(totalSteps - 1, s + 1))}
+                className="flex-1 py-2.5 rounded border border-gray-600 bg-gray-900 hover:bg-gray-800 text-gray-200 text-xs font-bold cursor-pointer transition-colors">
+                Next →
+              </button>
+            )}
+          </div>
+        </Panel>
+      </div>
 
       {/* ── Override prompt modal ──────────────────────────────────── */}
       {overridePrompt !== null && (
@@ -3141,10 +3318,10 @@ function BacktestLogTab() {
               entry with <span className="text-orange-400">Override Applied</span>. This cannot be waived.
             </div>
             <div className="flex gap-2">
-              <button onClick={confirmOverride} className="flex-1 py-1.5 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded cursor-pointer hover:bg-orange-950/40">
+              <button onClick={confirmOverride} className="flex-1 py-2 text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded cursor-pointer hover:bg-orange-950/40">
                 Accept Override + −8 SQS
               </button>
-              <button onClick={()=>setOverridePrompt(null)} className="flex-1 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500">
+              <button onClick={()=>setOverridePrompt(null)} className="flex-1 py-2 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500">
                 Cancel
               </button>
             </div>
@@ -3161,78 +3338,108 @@ function BacktestLogTab() {
               Full sequence is not marked complete. Are you sure you want to log this entry?
             </div>
             <div className="flex gap-2">
-              <button onClick={doSave} className="flex-1 py-1.5 text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded cursor-pointer">Log Anyway</button>
-              <button onClick={()=>setConfirmIncomplete(false)} className="flex-1 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Go Back</button>
+              <button onClick={doSave} className="flex-1 py-2 text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded cursor-pointer">Log Anyway</button>
+              <button onClick={()=>setConfirmIncomplete(false)} className="flex-1 py-2 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Go Back</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── Saved logs + Section 10 second-pass ───────────────────── */}
-      <div className="bg-gray-950 border border-gray-800 rounded-sm">
-        <button onClick={()=>{ setShowLogs(l=>!l); if(!showLogs) loadRecentLogs(); }}
-          className="w-full flex items-center justify-between px-4 py-2.5 text-xs text-gray-500 hover:text-gray-300 cursor-pointer">
-          <span className="uppercase tracking-widest">📓 Recent Backtest Logs ({recentLogs.length})</span>
-          <span>{showLogs ? '▲' : '▼'}</span>
-        </button>
-        {showLogs && (
-          <div className="border-t border-gray-800">
-            {recentLogs.length === 0 && <div className="px-4 py-3 text-xs text-gray-700">No entries yet.</div>}
-            {recentLogs.map(log => {
-              const b      = log.sqs_score != null ? sqsBand(log.sqs_score) : { grade:'—', color:'text-gray-600' };
-              const needCF = log.setup_played_out == null;
-              return (
-                <div key={log.id} className="border-b border-gray-800/50 last:border-b-0 px-4 py-2.5">
-                  <div className="flex items-center gap-2 flex-wrap text-xs">
-                    <span className="text-gray-600">{log.date}</span>
-                    <span className="text-gray-300 font-bold">{log.pair}</span>
-                    <span className={log.direction==='Long'?'text-green-500':'text-red-500'}>{log.direction}</span>
-                    <span className="text-gray-600 truncate max-w-[120px]">{log.sequence_type}</span>
-                    {log.sqs_score != null && <span className={`font-bold ml-auto ${b.color}`}>SQS {log.sqs_score} {b.grade}</span>}
-                    <span className={log.result==='Win'?'text-green-500':log.result==='Loss'?'text-red-500':'text-gray-500'}>{log.result||'—'}</span>
-                    {!log.enrichment_complete && <span className="text-yellow-600 border border-yellow-800 rounded px-1">enrichment pending</span>}
-                    {entry.bias_aligned === false && <span className="text-yellow-500 border border-yellow-800 rounded px-1">⚠ bias unaligned</span>}
+      {/* ── Recent logs + Section 10 counterfactual ───────────────── */}
+      <div className="mt-4 px-4">
+        <div className="bg-gray-950 border border-gray-800 rounded-sm">
+          <button onClick={()=>{ setShowLogs(l=>!l); if(!showLogs) loadRecentLogs(); }}
+            className="w-full flex items-center justify-between px-4 py-2.5 text-xs text-gray-500 hover:text-gray-300 cursor-pointer">
+            <span className="uppercase tracking-widest">📓 Recent Backtest Logs ({recentLogs.length})</span>
+            <span>{showLogs ? '▲' : '▼'}</span>
+          </button>
+          {showLogs && (
+            <div className="border-t border-gray-800">
+              {recentLogs.length === 0 && <div className="px-4 py-3 text-xs text-gray-700">No entries yet.</div>}
+              {recentLogs.map(log => {
+                const b      = log.sqs_score != null ? sqsBand(log.sqs_score) : { grade:'—', color:'text-gray-600', ring:'border-gray-800' };
+                const needCF = log.setup_played_out == null;
+                return (
+                  <div key={log.id} className="border-b border-gray-800/50 last:border-b-0 px-4 py-3">
+                    {/* Primary row: pair, dir, date, seq, sqs, result */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-gray-200 text-xs">{log.pair||'—'}</span>
+                      <span className={`text-xs font-medium ${log.direction==='Long'?'text-green-500':'text-red-500'}`}>{log.direction||'—'}</span>
+                      <span className="text-gray-600 text-xs">{log.date||'—'}</span>
+                      <span className="text-gray-600 text-xs truncate max-w-[100px]">{log.sequence_type||'—'}</span>
+                      <div className="flex items-center gap-1.5 ml-auto">
+                        {log.sqs_score != null && (
+                          <span className={`text-xs font-bold border rounded px-1.5 py-0.5 ${b.color} ${b.ring}`}>
+                            {log.sqs_score} {b.grade}
+                          </span>
+                        )}
+                        <span className={`text-xs font-medium px-1.5 py-0.5 rounded border ${
+                          log.result==='Win'  ? 'text-green-400 border-green-900 bg-green-950/20' :
+                          log.result==='Loss' ? 'text-red-400 border-red-900 bg-red-950/20' :
+                                               'text-gray-500 border-gray-800'
+                        }`}>{log.result||'—'}</span>
+                      </div>
+                    </div>
+                    {/* Persistent badge row */}
+                    {(log.bias_aligned === false || log.second_sweep_override) && (
+                      <div className="flex gap-1.5 mt-1.5 flex-wrap">
+                        {log.bias_aligned === false && (
+                          <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-500 rounded px-1.5 py-0.5">⚠ Bias Unaligned</span>
+                        )}
+                        {log.second_sweep_override && (
+                          <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-1.5 py-0.5">⚠ Override Applied −8</span>
+                        )}
+                      </div>
+                    )}
+                    {/* Screenshot thumbnail */}
+                    {log.chart_screenshot_url && (
+                      <div className="mt-2">
+                        <img src={log.chart_screenshot_url} alt="chart" className="h-16 rounded border border-gray-800 object-contain bg-gray-950 cursor-pointer"
+                          onClick={() => window.open(log.chart_screenshot_url, '_blank')}/>
+                      </div>
+                    )}
+                    {/* Counterfactual */}
+                    {needCF && cfTarget !== log.id && (
+                      <button onClick={()=>{ setCfTarget(log.id); setCfForm({ setup_played_out:null, counterfactual_r:'', decision_correct:null }); }}
+                        className="mt-2 text-xs text-blue-400 border border-blue-900 hover:bg-blue-950/20 rounded px-2 py-1 cursor-pointer">
+                        + Add Counterfactual (S10)
+                      </button>
+                    )}
+                    {log.setup_played_out != null && (
+                      <div className="mt-1.5 text-xs text-gray-600">
+                        ✓ CF: {log.setup_played_out ? 'Played out' : 'Did not play'} · R {log.counterfactual_r ?? '—'} · {log.decision_correct ? 'Correct' : 'Decision incorrect'}
+                      </div>
+                    )}
+                    {cfTarget === log.id && (
+                      <div className="mt-2 border border-blue-900 bg-blue-950/10 rounded p-3 space-y-3">
+                        <div className="text-xs text-blue-400 font-bold uppercase tracking-wider">Section 10 — Counterfactual</div>
+                        <div>
+                          <FL>Did the setup play out after you closed / passed?</FL>
+                          <YN val={cfForm.setup_played_out} onChg={v=>setCfForm(p=>({...p,setup_played_out:v}))} yes="Yes — Played out" no="No — Did not play"/>
+                        </div>
+                        <div>
+                          <FL>Counterfactual R (what it would have achieved)</FL>
+                          <NI val={cfForm.counterfactual_r} onChg={v=>setCfForm(p=>({...p,counterfactual_r:v}))} ph="e.g. 8.0"/>
+                        </div>
+                        <div>
+                          <FL>Was the original decision correct?</FL>
+                          <YN val={cfForm.decision_correct} onChg={v=>setCfForm(p=>({...p,decision_correct:v}))} yes="Yes — Correct" no="No — Should have acted differently"/>
+                        </div>
+                        <div className="flex gap-2 pt-1">
+                          <button onClick={saveCF} disabled={cfSaving}
+                            className={`flex-1 py-2 text-xs rounded border cursor-pointer transition-colors ${cfSaving?'border-gray-700 text-gray-600':'border-blue-700 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50'}`}>
+                            {cfSaving ? 'Saving…' : 'Save Counterfactual'}
+                          </button>
+                          <button onClick={()=>setCfTarget(null)} className="px-3 py-2 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Cancel</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  {needCF && cfTarget !== log.id && (
-                    <button onClick={()=>{ setCfTarget(log.id); setCfForm({ setup_played_out:null, counterfactual_r:'', decision_correct:null }); }}
-                      className="mt-1.5 text-xs text-blue-400 border border-blue-900 hover:bg-blue-950/20 rounded px-2 py-0.5 cursor-pointer">
-                      + Add Counterfactual (Section 10)
-                    </button>
-                  )}
-                  {log.setup_played_out != null && (
-                    <div className="mt-1 text-xs text-gray-600">
-                      ✓ CF: {log.setup_played_out ? 'Played out' : 'Did not play'} · R {log.counterfactual_r ?? '—'} · {log.decision_correct ? 'Correct decision' : 'Decision incorrect'}
-                    </div>
-                  )}
-                  {cfTarget === log.id && (
-                    <div className="mt-2 border border-blue-900 bg-blue-950/10 rounded p-3 space-y-2.5">
-                      <div className="text-xs text-blue-400 font-bold uppercase tracking-wider">Section 10 — Counterfactual</div>
-                      <div>
-                        <FL>Did the setup play out after you closed / passed?</FL>
-                        <YN val={cfForm.setup_played_out} onChg={v=>setCfForm(p=>({...p,setup_played_out:v}))} yes="Yes — Played out" no="No — Did not play"/>
-                      </div>
-                      <div>
-                        <FL>Counterfactual R (what it would have achieved)</FL>
-                        <NI val={cfForm.counterfactual_r} onChg={v=>setCfForm(p=>({...p,counterfactual_r:v}))} ph="e.g. 8.0"/>
-                      </div>
-                      <div>
-                        <FL>Was the original decision correct?</FL>
-                        <YN val={cfForm.decision_correct} onChg={v=>setCfForm(p=>({...p,decision_correct:v}))} yes="Yes — Correct" no="No — Should have acted differently"/>
-                      </div>
-                      <div className="flex gap-2 pt-1">
-                        <button onClick={saveCF} disabled={cfSaving}
-                          className={`flex-1 py-1.5 text-xs rounded border cursor-pointer transition-colors ${cfSaving?'border-gray-700 text-gray-600':'border-blue-700 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50'}`}>
-                          {cfSaving ? 'Saving…' : 'Save Counterfactual'}
-                        </button>
-                        <button onClick={()=>setCfTarget(null)} className="px-3 py-1.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer">Cancel</button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
