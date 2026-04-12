@@ -305,6 +305,42 @@ function runPipeline(inp, journal) {
            tradeAllowed:decision==="VALID_TRADE" };
 }
 
+// ─── EVALUATION RECORDER ──────────────────────────────────────────────
+// Inserts a row into the evaluations table whenever the pipeline reaches
+// a definitive VALID or NO TRADE outcome.
+const SESSION_LABELS = {
+  london:'London', frankfurt:'Frankfurt', ny1pm:'NY 1PM',
+  ny2:'NY 2nd Hour', ny2pm:'NY 2nd Hour', london_lunch:'London Lunch',
+  outside:'Outside Window',
+};
+
+async function insertEvaluation(inp, ev, evaluationResult) {
+  const direction   = inp.htfBias==='bearish' ? 'Short' : inp.htfBias==='bullish' ? 'Long' : '';
+  const session     = SESSION_LABELS[inp.session] || inp.session || '';
+  const pipelineSnapshot = Object.fromEntries(
+    Object.entries(ev.results || {}).map(([k, v]) => ([k, { s: v.s, r: v.r }]))
+  );
+  let failedAt      = null;
+  let failureReason = null;
+  if (evaluationResult === 'NO TRADE') {
+    const fs  = PIPELINE.find(s => ev.results[s]?.s === S.FAIL);
+    failedAt      = fs ? STEP_NAME[fs] : null;
+    failureReason = ev.decReason || null;
+  }
+  const tradeDate = new Date().toISOString().split('T')[0];
+  const { error } = await supabase.from('evaluations').insert([{
+    pair:              inp.pair || '',
+    session,
+    direction,
+    evaluation_result: evaluationResult,
+    failed_at:         failedAt,
+    failure_reason:    failureReason,
+    pipeline_snapshot: pipelineSnapshot,
+    trade_date:        tradeDate,
+  }]);
+  if (error) console.error('Evaluation insert failed:', error.message);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // ANALYTICS ENGINE
 // ═══════════════════════════════════════════════════════════════════════
@@ -1155,6 +1191,15 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
             className="mt-3 w-full bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-400 py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer">
             + Save to Trade Journal
           </button>
+          {/* Log No Trade Evaluation — only shown when the pipeline resolves NO TRADE */}
+          {ev.decision==='NO_TRADE'&&(
+            <button onClick={async ()=>{
+              await insertEvaluation(inp, ev, 'NO TRADE');
+              alert('No trade evaluation logged.');
+            }} className="mt-2 w-full bg-red-950/30 hover:bg-red-950/50 border border-red-900 text-red-500 py-1.5 rounded text-xs uppercase tracking-wider cursor-pointer">
+              Log No Trade Evaluation
+            </button>
+          )}
         </div>
 
         {/* Save modal */}
@@ -1192,9 +1237,11 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
                 )}
               </div>
               <div className="flex gap-2">
-                <button onClick={()=>{
+                <button onClick={async ()=>{
                   const savedAt=inp.backtestMode&&inp.backtestDate?new Date(inp.backtestDate).toISOString():new Date().toISOString();
                   const pipelineSnapshot=Object.fromEntries(Object.entries(ev.results||{}).map(([k,v])=>([k,{s:v.s,r:v.r}])));
+                  // Record VALID evaluation before saving the trade
+                  if (ev.decision==='VALID_TRADE') await insertEvaluation(inp, ev, 'VALID');
                   addTrade({...inp,outcome:saveForm.outcome,rAchieved:parseFloat(saveForm.rAchieved)||0,notes:saveForm.notes,grade:ev.grade,savedAt,isBacktest:inp.backtestMode,images:saveForm.images,pipelineSnapshot});
                   setShowSave(false); setSaveForm({outcome:"win",rAchieved:"",notes:"",images:[]});
                 }} className="flex-1 bg-green-950 hover:bg-green-900 border border-green-800 text-green-400 py-1.5 rounded text-xs cursor-pointer">Save Trade</button>
