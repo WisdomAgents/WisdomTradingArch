@@ -2778,6 +2778,10 @@ function BacktestLogTab() {
   const [imgUploading, setImgUploading]  = useState(false);
   const [imgError,     setImgError]      = useState('');
   const [validationErrors, setValidationErrors] = useState({});
+  // ── Paste-to-pre-fill (Phase 0A) ─────────────────────────────────
+  const [pasteOpen,   setPasteOpen]   = useState(false);
+  const [pasteText,   setPasteText]   = useState('');
+  const [parseResult, setParseResult] = useState(null); // { filled:[], blank:[], count:n }
 
   const set       = (k, v) => setEntryRaw(p => ({ ...p, [k]: v }));
   const toggleArr = (k, v) => setEntryRaw(p => {
@@ -2965,6 +2969,204 @@ function BacktestLogTab() {
     if (!error) { setCfTarget(null); loadRecentLogs(); }
   };
 
+  // ── Paste-to-pre-fill parser ──────────────────────────────────────
+  const parsePaste = () => {
+    const t = pasteText;
+    if (!t.trim()) return;
+    const merged = {};
+    const filled = [];
+
+    const trySet = (key, val) => {
+      if (val !== null && val !== undefined && val !== '' && !(Array.isArray(val) && val.length === 0)) {
+        merged[key] = val;
+        if (!filled.includes(key)) filled.push(key);
+      }
+    };
+
+    // Date — YYYY-MM-DD or DD/MM/YYYY or DD-MM-YYYY
+    const dateM = t.match(/\b(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})\b/) ||
+                  t.match(/date\s*[:=]?\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/i);
+    if (dateM) {
+      const raw = dateM[1]; const pts = raw.split(/[-\/]/);
+      if (pts.length === 3) {
+        const [a,b,c] = pts;
+        const norm = a.length === 4
+          ? `${a}-${b.padStart(2,'0')}-${c.padStart(2,'0')}`
+          : c.length === 4 ? `${c}-${a.padStart(2,'0')}-${b.padStart(2,'0')}`
+          : raw;
+        trySet('date', norm);
+      }
+    }
+
+    // Pair
+    if (/eurusd/i.test(t))      trySet('pair', 'EURUSD');
+    else if (/gbpusd/i.test(t)) trySet('pair', 'GBPUSD');
+
+    // Direction
+    if      (/\b(long|buy)\b/i.test(t))   trySet('direction', 'Long');
+    else if (/\b(short|sell)\b/i.test(t)) trySet('direction', 'Short');
+
+    // Session — order matters (most specific first)
+    if      (/london\s*lunch/i.test(t))                           trySet('session', 'London Lunch');
+    else if (/frankfurt/i.test(t))                                trySet('session', 'Frankfurt');
+    else if (/ny\s*(after\s*lunch|pm)\b/i.test(t))               trySet('session', 'NY After Lunch');
+    else if (/ny\s*1\s*pm/i.test(t))                             trySet('session', 'NY After Lunch');
+    else if (/ny\s*(2nd|second)\s*hour/i.test(t))                trySet('session', 'NY 2nd Hour');
+    else if (/ny\s*(1st|first)\s*hour/i.test(t))                 trySet('session', 'NY 1st Hour');
+    else if (/\blondon\b/i.test(t))                              trySet('session', 'London');
+
+    // HTF Bias
+    const biasM = t.match(/(?:htf\s*)?bias\s*[:=]?\s*(bullish|bearish)/i);
+    if (biasM) trySet('htf_bias', biasM[1].charAt(0).toUpperCase() + biasM[1].slice(1).toLowerCase());
+
+    // Bias aligned
+    const alignM = t.match(/bias\s*(not\s*)?aligned/i);
+    if (alignM) trySet('bias_aligned', !/not\s/i.test(alignM[0]));
+
+    // Model type (array)
+    const modelMap = [
+      [/bullish\s*reversal/i,        'Bullish Reversal'],
+      [/bearish\s*reversal/i,        'Bearish Reversal'],
+      [/bullish\s*continuation/i,    'Bullish Continuation'],
+      [/bearish\s*continuation/i,    'Bearish Continuation'],
+      [/engineered\s*reversal/i,     'Engineered Reversal'],
+      [/engineered\s*continuation/i, 'Engineered Continuation'],
+    ];
+    const models = modelMap.filter(([r]) => r.test(t)).map(([,v]) => v);
+    if (models.length) trySet('model_type', models);
+
+    // Sequence type
+    if      (/multi.?stage/i.test(t))        trySet('sequence_type', 'Multi-Stage Engineered Reversal');
+    else if (/double\s*sweep/i.test(t))      trySet('sequence_type', 'Double Sweep');
+    else if (/complex\s*pullback/i.test(t))  trySet('sequence_type', 'Complex Pullback');
+    else if (/single\s*sweep/i.test(t))      trySet('sequence_type', 'Single Sweep');
+
+    // Sweep quality
+    const swM = t.match(/sweep\s*(?:quality\s*)?[:=]?\s*(clean|induced|partial)/i);
+    if (swM) trySet('sweep_quality', swM[1].charAt(0).toUpperCase() + swM[1].slice(1).toLowerCase());
+
+    // Displacement quality
+    const dqM = t.match(/disp(?:lacement)?\s*(?:quality\s*)?[:=]?\s*(strong|moderate|weak)/i);
+    if (dqM) trySet('displacement_quality', dqM[1].charAt(0).toUpperCase() + dqM[1].slice(1).toLowerCase());
+
+    // Displacement confirmed
+    if (/displace\w*\s*[:=]?\s*(?:confirmed|yes)\b/i.test(t)) trySet('displacement_confirmed', true);
+
+    // CHoCH / BOS — structure_confirmation + choch_or_bos
+    if      (/\bchoch\b/i.test(t)) { trySet('structure_confirmation', 'CHoCH'); trySet('choch_or_bos', 'CHoCH'); }
+    else if (/\bbos\b/i.test(t))   { trySet('structure_confirmation', 'BOS');   trySet('choch_or_bos', 'BOS');   }
+
+    // LTF confirmation
+    if      (/m1\s*choch/i.test(t)) trySet('ltf_confirmation', 'M1 CHoCH');
+    else if (/m1\s*bos/i.test(t))   trySet('ltf_confirmation', 'M1 BOS');
+    else if (/engulf/i.test(t))     trySet('ltf_confirmation', 'Engulf');
+
+    // POI type
+    if      (/\bhtf\s*(?:poi|zone|demand|supply)\b/i.test(t)) trySet('poi_type', 'HTF');
+    else if (/\bltf\s*(?:poi|zone|demand|supply)\b/i.test(t)) trySet('poi_type', 'LTF');
+
+    // Inducement confirmed
+    if (/induce\w*\s*[:=]?\s*(?:confirmed|yes)\b/i.test(t)) trySet('inducement_confirmed', true);
+
+    // Full sequence complete
+    if (/full\s*sequence\s*(?:[:=]?\s*)(?:complete|yes|confirmed)\b/i.test(t)) trySet('full_sequence_complete', true);
+
+    // Entry price — forex decimal format
+    const epM = t.match(/entry\s*(?:price\s*)?[:=]?\s*([\d]{1,2}\.[\d]{3,5})\b/i);
+    if (epM) trySet('entry_price', epM[1]);
+
+    // Stop price
+    const spM = t.match(/(?:stop|sl|s\.l\.)\s*(?:price\s*)?[:=]?\s*([\d]{1,2}\.[\d]{3,5})\b/i);
+    if (spM) trySet('stop_price', spM[1]);
+
+    // Target RR
+    const rrM = t.match(/(?:target\s*(?:rr|r\/r)|rr\s*[:=]|1\s*:\s*)([0-9]+\.?[0-9]*)/i);
+    if (rrM) trySet('target_rr', rrM[1]);
+
+    // R achieved — signed notation preferred (+6.5R / -1R), fallback to explicit label
+    const rAchM = t.match(/([+-][\d]+\.?[\d]*)\s*R\b/i)
+      || t.match(/r\s*achieved\s*[:=]\s*([+-]?[\d]+\.?[\d]*)/i)
+      || t.match(/result\s*[:=]\s*([+-]?[\d]+\.?[\d]*)\s*R\b/i);
+    if (rAchM) trySet('r_achieved', rAchM[1]);
+
+    // Result
+    if      (/\bno\s*trade\b/i.test(t))                     trySet('result', 'No Trade');
+    else if (/\b(loss|lost|loser)\b/i.test(t))              trySet('result', 'Loss');
+    else if (/\b(break\s*even|b\.?e\.?)\b/i.test(t))        trySet('result', 'Break Even');
+    else if (/\bwin\b/i.test(t))                             trySet('result', 'Win');
+
+    // Trade grade
+    const grM = t.match(/grade\s*[:=]?\s*(A\+|A|B)\b/i);
+    if (grM) trySet('trade_grade', grM[1].toUpperCase() === 'A+' ? 'A+' : grM[1].toUpperCase());
+
+    // Liquidity type (array) + tier inference
+    const liqMap = [
+      [/weekly\s*high/i,              'Weekly High'],
+      [/weekly\s*low/i,               'Weekly Low'],
+      [/\bPDH\b/,                     'PDH'],
+      [/\bPDL\b/,                     'PDL'],
+      [/\bPDC\b/,                     'PDC'],
+      [/daily\s*open/i,               'Daily Open'],
+      [/asia\s*high/i,                'Asia High'],
+      [/asia\s*low/i,                 'Asia Low'],
+      [/frankfurt\s*high/i,           'Frankfurt High'],
+      [/frankfurt\s*low/i,            'Frankfurt Low'],
+      [/london\s*(?:open\s*)?high/i,  'London Open High'],
+      [/london\s*(?:open\s*)?low/i,   'London Open Low'],
+      [/kill\s*zone\s*high/i,         'Kill Zone High'],
+      [/kill\s*zone\s*low/i,          'Kill Zone Low'],
+      [/session\s*high/i,             'Session High'],
+      [/session\s*low/i,              'Session Low'],
+      [/equal\s*high/i,               'Equal Highs'],
+      [/equal\s*low/i,                'Equal Lows'],
+      [/\bHOPD\b/,                    'HOPD'],
+      [/\bHOPW\b/,                    'HOPW'],
+      [/trendline\s*liq/i,            'Trendline Liquidity'],
+      [/internal\s*liq/i,             'Internal Liquidity'],
+      [/swing\s*high/i,               'Swing High'],
+      [/swing\s*low/i,                'Swing Low'],
+      [/smc\s*trap/i,                 'SMC Trap Zone'],
+    ];
+    const liqFound = liqMap.filter(([r]) => r.test(t)).map(([,v]) => v);
+    if (liqFound.length) {
+      trySet('liquidity_type', liqFound);
+      const t1 = ['Weekly High','Weekly Low','PDH','PDL','PDC','Daily Open'];
+      const t2 = ['Asia High','Asia Low','Asia Open','London Open High','London Open Low',
+                  'Frankfurt High','Frankfurt Low','Session High','Session Low',
+                  'Kill Zone High','Kill Zone Low'];
+      if      (liqFound.some(l => t1.includes(l))) trySet('liquidity_tier', 'Tier 1');
+      else if (liqFound.some(l => t2.includes(l))) trySet('liquidity_tier', 'Tier 2');
+      else                                          trySet('liquidity_tier', 'Tier 3');
+    }
+
+    // Freeform text — preserve into price_context if nothing more specific found
+    const notesM = t.match(/(?:notes?|key\s*takeaway|takeaway)\s*[:=]?\s*([^\n]{10,})/i);
+    if (notesM) trySet('key_takeaway', notesM[1].trim().slice(0, 500));
+
+    const ctxM = t.match(/(?:context|price\s*context|market)\s*[:=]?\s*([^\n]{10,})/i);
+    if (ctxM) trySet('price_context', ctxM[1].trim().slice(0, 500));
+
+    const execM = t.match(/(?:execution|exec)\s*[:=]?\s*([^\n]{10,})/i);
+    if (execM) trySet('execution_notes', execM[1].trim().slice(0, 500));
+
+    // Fallback: if no notes fields parsed, store full text in price_context for reference
+    if (!merged.key_takeaway && !merged.price_context && t.trim().length > 30) {
+      trySet('price_context', t.trim().slice(0, 800));
+    }
+
+    // Determine which key fields remain blank for the summary
+    const KEY_FIELDS = ['date','pair','direction','session','htf_bias','model_type','sequence_type',
+      'liquidity_type','sweep_quality','displacement_quality','structure_confirmation',
+      'ltf_confirmation','entry_price','stop_price','result','trade_grade'];
+    const blank = KEY_FIELDS.filter(f => !filled.includes(f));
+
+    setParseResult({ filled, blank, count: filled.length });
+    setEntryRaw(prev => ({ ...prev, ...merged }));
+    setPasteOpen(false);
+    setPasteText('');
+    setStep(0); // Return to step 1 for review
+  };
+
   // ── Micro UI (scoped) ───────────────────────────────────────────────
   const TG = ({ opts, val, onSel, multi = false, disabled: disabledFn, cols = 3 }) => (
     <div className="grid gap-1.5" style={{ gridTemplateColumns:`repeat(${cols},minmax(0,1fr))` }}>
@@ -3121,6 +3323,84 @@ function BacktestLogTab() {
           {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
           {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
         </div>
+      </div>
+
+      {/* ── Paste-to-pre-fill panel ───────────────────────────────── */}
+      <div className="px-4 pt-3">
+        <button
+          onClick={() => { setPasteOpen(o => !o); if (pasteOpen) setPasteText(''); }}
+          className="w-full flex items-center justify-between px-3 py-2 bg-gray-950 border border-gray-700 hover:border-gray-600 rounded text-xs text-gray-500 hover:text-gray-300 cursor-pointer transition-colors"
+        >
+          <span className="flex items-center gap-2">
+            <span>📋</span>
+            <span className="uppercase tracking-widest">Paste Discord Recap — Auto Pre-fill</span>
+          </span>
+          <span className="text-gray-700 text-xs">{pasteOpen ? '▲ close' : '▼ open'}</span>
+        </button>
+
+        {/* Result summary — shown after parse when panel is collapsed */}
+        {parseResult && !pasteOpen && (
+          <div className="mt-1.5 border border-gray-800 rounded px-3 py-2 space-y-1">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-green-600 font-bold">{parseResult.count} field{parseResult.count !== 1 ? 's' : ''} pre-filled</span>
+              {parseResult.blank.length > 0 && (
+                <span className="text-yellow-700">· {parseResult.blank.length} still blank — fill manually</span>
+              )}
+              <button
+                onClick={() => { setParseResult(null); setEntryRaw({ ...BL_EMPTY }); setStep(0); }}
+                className="ml-auto text-gray-700 hover:text-red-500 cursor-pointer text-xs"
+              >✕ clear</button>
+            </div>
+            {parseResult.filled.length > 0 && (
+              <div className="text-gray-700 text-xs leading-relaxed">
+                Filled: {parseResult.filled.join(' · ')}
+              </div>
+            )}
+            {parseResult.blank.length > 0 && (
+              <div className="text-yellow-900 text-xs leading-relaxed">
+                Still needed: {parseResult.blank.join(' · ')}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Paste input — shown when open */}
+        {pasteOpen && (
+          <div className="mt-1.5 border border-gray-700 rounded p-3 space-y-3 bg-gray-950">
+            <div className="text-xs text-gray-600 leading-relaxed">
+              Paste a Discord recap entry below. Recognised fields pre-fill the form. Review each step before saving — this is pre-fill only, not auto-save.
+            </div>
+            <textarea
+              value={pasteText}
+              onChange={e => setPasteText(e.target.value)}
+              placeholder={"Paste Discord recap text here…\n\nExample fields recognised:\nPair · Direction · Session · HTF Bias · Model · Sequence\nSweep Quality · Displacement · CHoCH/BOS · LTF confirm\nEntry · Stop · RR · Result · Grade · Liquidity levels"}
+              rows={9}
+              className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none focus:border-gray-500 placeholder-gray-800 resize-none font-mono leading-relaxed"
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={parsePaste}
+                disabled={!pasteText.trim()}
+                className={`flex-1 py-2.5 text-xs rounded border font-bold uppercase tracking-wider cursor-pointer transition-colors ${
+                  pasteText.trim()
+                    ? 'border-blue-700 bg-blue-950/30 text-blue-300 hover:bg-blue-950/60'
+                    : 'border-gray-800 text-gray-700 cursor-not-allowed'
+                }`}
+              >
+                Parse &amp; Pre-fill →
+              </button>
+              <button
+                onClick={() => { setPasteOpen(false); setPasteText(''); }}
+                className="px-4 py-2.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+            <div className="text-xs text-gray-800">
+              Fields left blank are intentional — do not guess. Fill them manually in the steps below.
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ── Progress bar ───────────────────────────────────────────── */}
