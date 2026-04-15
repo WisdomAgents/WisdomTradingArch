@@ -2876,6 +2876,34 @@ function BacktestLogTab() {
   const liveSQS  = useMemo(() => calculateSQS(entry), [entry]);
   const liveBand = sqsBand(liveSQS);
 
+  // ── Live completion tracker — updates on every entry change ──────────
+  const KEY_FIELDS_LIVE = [
+    { key: 'date',                  label: 'Date'        , check: e => !!e.date },
+    { key: 'pair',                  label: 'Pair'        , check: e => !!e.pair },
+    { key: 'direction',             label: 'Direction'   , check: e => !!e.direction },
+    { key: 'session',               label: 'Session'     , check: e => !!e.session },
+    { key: 'htf_bias',              label: 'HTF Bias'    , check: e => !!e.htf_bias },
+    { key: 'model_type',            label: 'Model'       , check: e => Array.isArray(e.model_type) && e.model_type.length > 0 },
+    { key: 'sequence_type',         label: 'Sequence'    , check: e => !!e.sequence_type },
+    { key: 'liquidity_type',        label: 'Liquidity'   , check: e => Array.isArray(e.liquidity_type) && e.liquidity_type.length > 0 },
+    { key: 'sweep_quality',         label: 'Sweep'       , check: e => !!e.sweep_quality },
+    { key: 'displacement_quality',  label: 'Displacement', check: e => !!e.displacement_quality },
+    { key: 'structure_confirmation',label: 'Structure'   , check: e => !!e.structure_confirmation },
+    { key: 'ltf_confirmation',      label: 'LTF'         , check: e => !!e.ltf_confirmation },
+    { key: 'entry_price',           label: 'Entry'       , check: e => !!e.entry_price },
+    { key: 'stop_price',            label: 'Stop'        , check: e => !!e.stop_price },
+    { key: 'result',                label: 'Result'      , check: e => !!e.result },
+    { key: 'trade_grade',           label: 'Grade'       , check: e => !!e.trade_grade },
+  ];
+
+  const liveCompletion = useMemo(() => {
+    const parsedKeys = new Set(parseResult ? parseResult.filled : []);
+    const done  = KEY_FIELDS_LIVE.filter(f =>  f.check(entry)).map(f => ({ ...f, source: parsedKeys.has(f.key) ? 'parsed' : 'manual' }));
+    const blank = KEY_FIELDS_LIVE.filter(f => !f.check(entry));
+    return { done, blank };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry, parseResult]);
+
   // Dynamic steps (S4 only when sequence needs it)
   const steps = useMemo(() => [
     { id:'context',      label:'Context' },
@@ -3139,32 +3167,88 @@ function BacktestLogTab() {
       else                                          trySet('liquidity_tier', 'Tier 3');
     }
 
-    // Freeform text — preserve into price_context if nothing more specific found
+    // ── Key takeaway — verbatim if explicitly labelled ─────────────────
     const notesM = t.match(/(?:notes?|key\s*takeaway|takeaway)\s*[:=]?\s*([^\n]{10,})/i);
     if (notesM) trySet('key_takeaway', notesM[1].trim().slice(0, 500));
 
-    const ctxM = t.match(/(?:context|price\s*context|market)\s*[:=]?\s*([^\n]{10,})/i);
-    if (ctxM) trySet('price_context', ctxM[1].trim().slice(0, 500));
+    // ── Structured notes builder ────────────────────────────────────────
+    // Build price_context and execution_notes from parsed fields only.
+    // Only include a sentence when its source data was actually parsed.
+    // Do NOT copy raw text. Do NOT infer missing values.
+    const ctx  = []; // price_context sentences
+    const exec = []; // execution_notes sentences
 
-    const execM = t.match(/(?:execution|exec)\s*[:=]?\s*([^\n]{10,})/i);
-    if (execM) trySet('execution_notes', execM[1].trim().slice(0, 500));
+    // price_context — HTF positioning, liquidity, bias, pre-session context
+    if (merged.pair && merged.direction)
+      ctx.push(`${merged.pair} ${merged.direction} trade.`);
 
-    // Fallback: if no notes fields parsed, store full text in price_context for reference
-    if (!merged.key_takeaway && !merged.price_context && t.trim().length > 30) {
-      trySet('price_context', t.trim().slice(0, 800));
+    if (merged.htf_bias) {
+      const alignStr = merged.bias_aligned === true  ? ', bias aligned'      :
+                       merged.bias_aligned === false ? ', bias NOT aligned'  : '';
+      ctx.push(`${merged.htf_bias} HTF bias${alignStr}.`);
     }
 
-    // Determine which key fields remain blank for the summary
-    const KEY_FIELDS = ['date','pair','direction','session','htf_bias','model_type','sequence_type',
-      'liquidity_type','sweep_quality','displacement_quality','structure_confirmation',
-      'ltf_confirmation','entry_price','stop_price','result','trade_grade'];
-    const blank = KEY_FIELDS.filter(f => !filled.includes(f));
+    if (liqFound.length > 0) {
+      const tierStr = merged.liquidity_tier ? ` (${merged.liquidity_tier})` : '';
+      ctx.push(`Liquidity targeted: ${liqFound.slice(0, 4).join(', ')}${tierStr}.`);
+    }
+
+    if (merged.sweep_quality)
+      ctx.push(`${merged.sweep_quality} sweep confirmed.`);
+
+    // Pre-session context — grab first clause mentioning Asia or Frankfurt if present
+    const preM = t.match(/(?:asia|frankfurt)\s+[^.!?\n]{10,60}/i);
+    if (preM) ctx.push(preM[0].trim().replace(/\s+/g, ' ') + '.');
+
+    // execution_notes — sequence, displacement, entry trigger, stop, result
+    if (merged.sequence_type)
+      exec.push(`Sequence: ${merged.sequence_type}.`);
+
+    if (merged.displacement_quality) {
+      const structStr = merged.structure_confirmation ? ` with ${merged.structure_confirmation}` : '';
+      exec.push(`${merged.displacement_quality} displacement confirmed${structStr}.`);
+    }
+
+    if (merged.ltf_confirmation && merged.ltf_confirmation !== 'None') {
+      const epStr = merged.entry_price ? ` at ${merged.entry_price}` : '';
+      exec.push(`Entry trigger: ${merged.ltf_confirmation}${epStr}.`);
+    }
+
+    if (merged.stop_price) {
+      const ep = parseFloat(merged.entry_price);
+      const sp = parseFloat(merged.stop_price);
+      const distStr = (!isNaN(ep) && !isNaN(sp))
+        ? ` (${(Math.abs(ep - sp) * 10000).toFixed(1)}p)` : '';
+      exec.push(`Stop: ${merged.stop_price}${distStr}.`);
+    }
+
+    if (merged.result) {
+      const rStr  = merged.r_achieved   ? ` ${merged.r_achieved}R`      : '';
+      const grStr = merged.trade_grade  ? ` [${merged.trade_grade}]`    : '';
+      exec.push(`Result: ${merged.result}${rStr}${grStr}.`);
+    }
+
+    // Write notes — require at least 2 sentences to be considered meaningful
+    // Fallback: raw recap text into price_context only if builder produces nothing
+    if (ctx.length >= 2)  trySet('price_context',    ctx.join('  '));
+    if (exec.length >= 2) trySet('execution_notes',  exec.join('  '));
+
+    if (!merged.price_context && t.trim().length > 30)
+      trySet('price_context', t.trim().slice(0, 800));   // raw fallback
+
+    // ── Finalise ────────────────────────────────────────────────────────
+    // blank = key fields not yet in the parsed set (used for initial display)
+    const KEY_FIELDS_CHK = ['date','pair','direction','session','htf_bias','model_type',
+      'sequence_type','liquidity_type','sweep_quality','displacement_quality',
+      'structure_confirmation','ltf_confirmation','entry_price','stop_price',
+      'result','trade_grade'];
+    const blank = KEY_FIELDS_CHK.filter(f => !filled.includes(f));
 
     setParseResult({ filled, blank, count: filled.length });
     setEntryRaw(prev => ({ ...prev, ...merged }));
     setPasteOpen(false);
-    setPasteText('');
-    setStep(0); // Return to step 1 for review
+    // pasteText intentionally NOT cleared — text persists for reference
+    setStep(0);
   };
 
   // ── Micro UI (scoped) ───────────────────────────────────────────────
@@ -3327,57 +3411,106 @@ function BacktestLogTab() {
 
       {/* ── Paste-to-pre-fill panel ───────────────────────────────── */}
       <div className="px-4 pt-3">
+
+        {/* Toggle button */}
         <button
-          onClick={() => { setPasteOpen(o => !o); if (pasteOpen) setPasteText(''); }}
+          onClick={() => setPasteOpen(o => !o)}
           className="w-full flex items-center justify-between px-3 py-2 bg-gray-950 border border-gray-700 hover:border-gray-600 rounded text-xs text-gray-500 hover:text-gray-300 cursor-pointer transition-colors"
         >
           <span className="flex items-center gap-2">
             <span>📋</span>
-            <span className="uppercase tracking-widest">Paste Discord Recap — Auto Pre-fill</span>
+            <span className="uppercase tracking-widest">
+              Paste Discord Recap — Auto Pre-fill
+              {pasteText && !pasteOpen && <span className="text-blue-700 ml-1">· recap loaded</span>}
+            </span>
           </span>
           <span className="text-gray-700 text-xs">{pasteOpen ? '▲ close' : '▼ open'}</span>
         </button>
 
-        {/* Result summary — shown after parse when panel is collapsed */}
+        {/* ── Live completion tracker — visible when panel closed and recap parsed ── */}
         {parseResult && !pasteOpen && (
-          <div className="mt-1.5 border border-gray-800 rounded px-3 py-2 space-y-1">
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-green-600 font-bold">{parseResult.count} field{parseResult.count !== 1 ? 's' : ''} pre-filled</span>
-              {parseResult.blank.length > 0 && (
-                <span className="text-yellow-700">· {parseResult.blank.length} still blank — fill manually</span>
-              )}
+          <div className="mt-1.5 border border-gray-800 rounded p-2.5 space-y-2">
+
+            {/* Summary header */}
+            <div className="flex items-center justify-between text-xs">
+              <div className="flex items-center gap-3">
+                <span className="text-green-600 font-bold">
+                  {liveCompletion.done.length}/{KEY_FIELDS_LIVE.length} fields done
+                </span>
+                {liveCompletion.blank.length > 0 && (
+                  <span className="text-yellow-700">
+                    {liveCompletion.blank.length} still needed
+                  </span>
+                )}
+              </div>
               <button
-                onClick={() => { setParseResult(null); setEntryRaw({ ...BL_EMPTY }); setStep(0); }}
-                className="ml-auto text-gray-700 hover:text-red-500 cursor-pointer text-xs"
-              >✕ clear</button>
+                onClick={() => { setParseResult(null); setEntryRaw({ ...BL_EMPTY }); setPasteText(''); setStep(0); }}
+                className="text-gray-700 hover:text-red-500 cursor-pointer text-xs transition-colors"
+              >✕ clear all</button>
             </div>
-            {parseResult.filled.length > 0 && (
-              <div className="text-gray-700 text-xs leading-relaxed">
-                Filled: {parseResult.filled.join(' · ')}
+
+            {/* Done fields — parsed (green) vs manual (gray) */}
+            {liveCompletion.done.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {liveCompletion.done.map(f => (
+                  <span key={f.key} className={`text-xs px-1.5 py-0.5 rounded border ${
+                    f.source === 'parsed'
+                      ? 'border-green-900 bg-green-950/20 text-green-700'
+                      : 'border-gray-700 bg-gray-900/60 text-gray-500'
+                  }`}>
+                    {f.label}{f.source === 'parsed' ? ' ·p' : ''}
+                  </span>
+                ))}
               </div>
             )}
-            {parseResult.blank.length > 0 && (
-              <div className="text-yellow-900 text-xs leading-relaxed">
-                Still needed: {parseResult.blank.join(' · ')}
+
+            {/* Still needed fields */}
+            {liveCompletion.blank.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {liveCompletion.blank.map(f => (
+                  <span key={f.key} className="text-xs px-1.5 py-0.5 rounded border border-yellow-900/60 text-yellow-800">
+                    {f.label}
+                  </span>
+                ))}
               </div>
             )}
+
+            {/* Legend */}
+            <div className="flex gap-4 text-xs pt-0.5 border-t border-gray-800/50">
+              <span className="text-green-800">■ ·p parsed</span>
+              <span className="text-gray-600">■ manual</span>
+              <span className="text-yellow-900">■ needed</span>
+            </div>
           </div>
         )}
 
-        {/* Paste input — shown when open */}
+        {/* ── Paste input panel ── */}
         {pasteOpen && (
           <div className="mt-1.5 border border-gray-700 rounded p-3 space-y-3 bg-gray-950">
+
+            {/* Inline mini tracker when panel is open */}
+            {parseResult && (
+              <div className="flex items-center gap-3 text-xs border border-gray-800 rounded px-2.5 py-1.5">
+                <span className="text-green-700 font-bold">{liveCompletion.done.length}/{KEY_FIELDS_LIVE.length} done</span>
+                {liveCompletion.blank.length > 0 && (
+                  <span className="text-yellow-800">{liveCompletion.blank.length} needed: {liveCompletion.blank.map(f => f.label).join(' · ')}</span>
+                )}
+              </div>
+            )}
+
             <div className="text-xs text-gray-600 leading-relaxed">
-              Paste a Discord recap entry below. Recognised fields pre-fill the form. Review each step before saving — this is pre-fill only, not auto-save.
+              Paste a Discord recap below. Recognised fields pre-fill the form — text stays here for reference. Review each step before saving.
             </div>
+
             <textarea
               value={pasteText}
               onChange={e => setPasteText(e.target.value)}
-              placeholder={"Paste Discord recap text here…\n\nExample fields recognised:\nPair · Direction · Session · HTF Bias · Model · Sequence\nSweep Quality · Displacement · CHoCH/BOS · LTF confirm\nEntry · Stop · RR · Result · Grade · Liquidity levels"}
+              placeholder={"Paste Discord recap text here…\n\nRecognised: Pair · Direction · Session · HTF Bias · Model\nSequence · Sweep Quality · Displacement · CHoCH/BOS\nLTF Confirm · Entry · Stop · RR · Result · Grade · Liquidity"}
               rows={9}
               className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-xs px-3 py-2 rounded focus:outline-none focus:border-gray-500 placeholder-gray-800 resize-none font-mono leading-relaxed"
             />
-            <div className="flex gap-2">
+
+            <div className="flex gap-2 flex-wrap">
               <button
                 onClick={parsePaste}
                 disabled={!pasteText.trim()}
@@ -3387,17 +3520,26 @@ function BacktestLogTab() {
                     : 'border-gray-800 text-gray-700 cursor-not-allowed'
                 }`}
               >
-                Parse &amp; Pre-fill →
+                {parseResult ? 'Re-parse & Update →' : 'Parse & Pre-fill →'}
               </button>
+              {pasteText && (
+                <button
+                  onClick={() => setPasteText('')}
+                  className="px-3 py-2.5 text-xs border border-gray-700 text-gray-600 rounded cursor-pointer hover:border-red-900 hover:text-red-500 transition-colors"
+                >
+                  Clear recap
+                </button>
+              )}
               <button
-                onClick={() => { setPasteOpen(false); setPasteText(''); }}
-                className="px-4 py-2.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500 transition-colors"
+                onClick={() => setPasteOpen(false)}
+                className="px-3 py-2.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500 transition-colors"
               >
-                Cancel
+                Close
               </button>
             </div>
+
             <div className="text-xs text-gray-800">
-              Fields left blank are intentional — do not guess. Fill them manually in the steps below.
+              Fields left blank are intentional — do not guess. Fill them in the steps below.
             </div>
           </div>
         )}
