@@ -2745,9 +2745,9 @@ function sqsBand(score) {
 
 // ─── Blank entry template ─────────────────────────────────────────────
 const BL_EMPTY = {
-  date: '',
+  date: new Date().toISOString().split('T')[0],
   pair: 'EURUSD', direction: '', session: '', htf_bias: '', bias_aligned: null,
-  model_type: '', model_status: '', sequence_type: '',
+  model_type: [], model_status: '', sequence_type: '',
   liquidity_tier: '', liquidity_type: [], sweep_quality: '', sweep_distance_pips: '',
   failed_continuation: null, secondary_liquidity_tier: '', secondary_liquidity_type: [],
   secondary_sweep_quality: '', secondary_displacement_quality: '', second_sweep_override: false,
@@ -2789,13 +2789,6 @@ function BacktestLogTab() {
     return { ...p, [k]: a.includes(v) ? a.filter(x => x !== v) : [...a, v] };
   });
 
-  // BUG-004: Auto-populate R Achieved when Result=Win and Exit Reason=Target Hit
-  useEffect(() => {
-    if (entry.result === 'Win' && entry.exit_reason === 'Target Hit' && entry.target_rr && !entry.r_achieved) {
-      setEntryRaw(p => ({ ...p, r_achieved: String(p.target_rr) }));
-    }
-  }, [entry.result, entry.exit_reason]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // FIX 2: Validation function
   const validateStep = (id) => {
     const errs = {};
@@ -2807,7 +2800,7 @@ function BacktestLogTab() {
         if (entry.bias_aligned === null) errs.bias_aligned = 'Required';
         break;
       case 'sequence':
-        if (!entry.model_type) errs.model_type = 'Required';
+        if (!Array.isArray(entry.model_type) || entry.model_type.length === 0) errs.model_type = 'Required';
         if (!entry.sequence_type) errs.sequence_type = 'Required';
         break;
       case 'primary_sweep':
@@ -2890,7 +2883,7 @@ function BacktestLogTab() {
     { key: 'direction',             label: 'Direction'   , check: e => !!e.direction },
     { key: 'session',               label: 'Session'     , check: e => !!e.session },
     { key: 'htf_bias',              label: 'HTF Bias'    , check: e => !!e.htf_bias },
-    { key: 'model_type',            label: 'Model'       , check: e => !!e.model_type },
+    { key: 'model_type',            label: 'Model'       , check: e => Array.isArray(e.model_type) && e.model_type.length > 0 },
     { key: 'sequence_type',         label: 'Sequence'    , check: e => !!e.sequence_type },
     { key: 'liquidity_type',        label: 'Liquidity'   , check: e => Array.isArray(e.liquidity_type) && e.liquidity_type.length > 0 },
     { key: 'sweep_quality',         label: 'Sweep'       , check: e => !!e.sweep_quality },
@@ -2936,7 +2929,7 @@ function BacktestLogTab() {
       case 'context':
         return `${entry.pair||'—'} ${entry.direction||'—'} · ${entry.session||'—'} · HTF: ${entry.htf_bias||'—'}${entry.bias_aligned===true?' ✓ aligned':entry.bias_aligned===false?' ⚠ NOT aligned':''}`;
       case 'sequence':
-        return `${entry.sequence_type||'—'} · ${entry.model_type||'—'} · ${entry.model_status||'—'}`;
+        return `${entry.sequence_type||'—'} · ${(entry.model_type||[]).join(', ')||'—'} · ${entry.model_status||'—'}`;
       case 'primary_sweep':
         return `${entry.liquidity_tier||'—'} · ${entry.sweep_quality||'—'} sweep · ${entry.sweep_distance_pips||'—'}p`;
       case 'second_sweep':
@@ -3068,7 +3061,7 @@ function BacktestLogTab() {
       [/engineered\s*continuation/i, 'Engineered Continuation'],
     ];
     const models = modelMap.filter(([r]) => r.test(t)).map(([,v]) => v);
-    if (models.length) trySet('model_type', models[0]);
+    if (models.length) trySet('model_type', models);
 
     // Sequence type
     if      (/multi.?stage/i.test(t))        trySet('sequence_type', 'Multi-Stage Engineered Reversal');
@@ -3076,18 +3069,9 @@ function BacktestLogTab() {
     else if (/complex\s*pullback/i.test(t))  trySet('sequence_type', 'Complex Pullback');
     else if (/single\s*sweep/i.test(t))      trySet('sequence_type', 'Single Sweep');
 
-    // Sweep quality — BUG-005: explicit label first, then natural-language phrases
-    const swM = t.match(/sweep\s*(?:quality\s*)?[:=]?\s*(clean|induced|partial)/i)
-      || t.match(/\b(clean)\s*(?:sweep|break|wick)\b/i)
-      || t.match(/\b(partial)\s*(?:sweep|fill|wick)\b/i)
-      || t.match(/\b(induced)\s*(?:sweep|entry|move)\b/i);
+    // Sweep quality
+    const swM = t.match(/sweep\s*(?:quality\s*)?[:=]?\s*(clean|induced|partial)/i);
     if (swM) trySet('sweep_quality', swM[1].charAt(0).toUpperCase() + swM[1].slice(1).toLowerCase());
-
-    // Sweep distance — BUG-005: catch pip values adjacent to sweep language
-    const swDistM = t.match(/sweep\s*distance\s*[:=]?\s*(\d+\.?\d*)/i)
-      || t.match(/(?:swept?|wick(?:ed)?|ran|extended?)\s+(?:\w+\s+){0,3}?(\d+\.?\d*)\s*(?:pips?|pts?)\b/i)
-      || t.match(/(\d+\.?\d*)\s*(?:pips?|pts?)\s*(?:sweep|wick|extension|below|above|through)/i);
-    if (swDistM) trySet('sweep_distance_pips', swDistM[1]);
 
     // Displacement quality
     const dqM = t.match(/disp(?:lacement)?\s*(?:quality\s*)?[:=]?\s*(strong|moderate|weak)/i);
@@ -3144,41 +3128,32 @@ function BacktestLogTab() {
     if (grM) trySet('trade_grade', grM[1].toUpperCase() === 'A+' ? 'A+' : grM[1].toUpperCase());
 
     // Liquidity type (array) + tier inference
-    // BUG-005: expanded with natural-language Discord variants
     const liqMap = [
-      [/weekly\s*high/i,                          'Weekly High'],
-      [/weekly\s*low/i,                           'Weekly Low'],
-      [/\bPDH\b/,                                 'PDH'],
-      [/\bPDL\b/,                                 'PDL'],
-      [/\bPDC\b/,                                 'PDC'],
-      [/prev(?:ious)?\s*day\s*high/i,             'PDH'],   // "previous day high"
-      [/prev(?:ious)?\s*day\s*low/i,              'PDL'],   // "previous day low"
-      [/prev(?:ious)?\s*day\s*close/i,            'PDC'],   // "previous day close"
-      [/daily\s*open/i,                           'Daily Open'],
-      [/asian?\s*(?:session\s*)?high/i,           'Asia High'],  // "Asian high" / "Asia high"
-      [/asian?\s*(?:session\s*)?low/i,            'Asia Low'],
-      [/asian?\s*(?:session\s*)?open/i,           'Asia Open'],
-      [/frankfurt\s*high/i,                       'Frankfurt High'],
-      [/frankfurt\s*low/i,                        'Frankfurt Low'],
-      [/london\s*(?:open\s*)?high/i,              'London Open High'],
-      [/london\s*(?:open\s*)?low/i,               'London Open Low'],
-      [/\bny\s*open\s*high/i,                     'NY Open High'],
-      [/\bny\s*open\s*low/i,                      'NY Open Low'],
-      [/kill\s*zone\s*high/i,                     'Kill Zone High'],
-      [/kill\s*zone\s*low/i,                      'Kill Zone Low'],
-      [/session\s*high/i,                         'Session High'],
-      [/session\s*low/i,                          'Session Low'],
-      [/(?:equal|eq\.?)\s*high/i,                 'Equal Highs'],  // "EQ high" / "equal high"
-      [/(?:equal|eq\.?)\s*low/i,                  'Equal Lows'],
-      [/\bHOPD\b/,                                'HOPD'],
-      [/\bHOPW\b/,                                'HOPW'],
-      [/trendline\s*liq/i,                        'Trendline Liquidity'],
-      [/trendline\s*(?:sweep|swept|level)/i,      'Trendline Liquidity'], // "trendline swept"
-      [/internal\s*liq/i,                         'Internal Liquidity'],
-      [/swing\s*high/i,                           'Swing High'],
-      [/swing\s*low/i,                            'Swing Low'],
-      [/smc\s*trap/i,                             'SMC Trap Zone'],
-      [/induced\s*ob/i,                           'Induced OB'],
+      [/weekly\s*high/i,              'Weekly High'],
+      [/weekly\s*low/i,               'Weekly Low'],
+      [/\bPDH\b/,                     'PDH'],
+      [/\bPDL\b/,                     'PDL'],
+      [/\bPDC\b/,                     'PDC'],
+      [/daily\s*open/i,               'Daily Open'],
+      [/asia\s*high/i,                'Asia High'],
+      [/asia\s*low/i,                 'Asia Low'],
+      [/frankfurt\s*high/i,           'Frankfurt High'],
+      [/frankfurt\s*low/i,            'Frankfurt Low'],
+      [/london\s*(?:open\s*)?high/i,  'London Open High'],
+      [/london\s*(?:open\s*)?low/i,   'London Open Low'],
+      [/kill\s*zone\s*high/i,         'Kill Zone High'],
+      [/kill\s*zone\s*low/i,          'Kill Zone Low'],
+      [/session\s*high/i,             'Session High'],
+      [/session\s*low/i,              'Session Low'],
+      [/equal\s*high/i,               'Equal Highs'],
+      [/equal\s*low/i,                'Equal Lows'],
+      [/\bHOPD\b/,                    'HOPD'],
+      [/\bHOPW\b/,                    'HOPW'],
+      [/trendline\s*liq/i,            'Trendline Liquidity'],
+      [/internal\s*liq/i,             'Internal Liquidity'],
+      [/swing\s*high/i,               'Swing High'],
+      [/swing\s*low/i,                'Swing Low'],
+      [/smc\s*trap/i,                 'SMC Trap Zone'],
     ];
     const liqFound = liqMap.filter(([r]) => r.test(t)).map(([,v]) => v);
     if (liqFound.length) {
@@ -3378,8 +3353,8 @@ function BacktestLogTab() {
     {
       tier: 'Tier 3',
       header: 'TIER 3 — INTERNAL',
-      items: ['EQ Highs','EQ Lows','Trendline Liquidity','Internal Range','Swing High','Swing Low','Induced OB'],
-      tip: 'Internal range levels. Lower significance. EQ highs and lows, swing points, trendlines, induced OB sweeps',
+      items: ['EQ Highs','EQ Lows','Trendline Liquidity','Internal Range','Swing High','Swing Low'],
+      tip: 'Internal range levels. Lower significance. EQ highs and lows, swing points, trendlines',
     },
   ];
 
@@ -3656,12 +3631,12 @@ function BacktestLogTab() {
           {currentId === 'sequence' && (
             <div className="space-y-4">
               <div>
-                <FL>Model Type <InfoTip content="Select the model type for this setup — single select only"/></FL>
+                <FL>Model Type <InfoTip content="Select all model types that apply to this setup"/></FL>
                 <div className={`grid gap-1.5 grid-cols-3 ${validationErrors.model_type ? 'ring-1 ring-red-500 rounded' : ''}`}>
                   {O.models.map(([v, l]) => {
-                    const active = entry.model_type === v;
+                    const active = Array.isArray(entry.model_type) && entry.model_type.includes(v);
                     return (
-                      <button key={v} onClick={() => set('model_type', active ? '' : v)}
+                      <button key={v} onClick={() => toggleArr('model_type', v)}
                         className={`relative py-3 px-2 rounded border text-xs cursor-pointer text-center leading-tight transition-colors ${
                           active ? 'border-blue-500 bg-blue-900/60 text-blue-100 font-bold ring-1 ring-blue-500 ring-inset' :
                                    'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-gray-200 bg-gray-950 hover:bg-gray-900'
@@ -3718,16 +3693,8 @@ function BacktestLogTab() {
                           const active = entry.liquidity_type.includes(item);
                           return (
                             <button key={item} onClick={() => {
-                              // BUG-006: derive tier from all remaining selections,
-                              // always using highest significance (lowest tier number)
-                              const newTypes = entry.liquidity_type.includes(item)
-                                ? entry.liquidity_type.filter(x => x !== item)
-                                : [...entry.liquidity_type, item];
-                              const _t1 = TIER_COLS[0].items, _t2 = TIER_COLS[1].items;
-                              const derivedTier = newTypes.some(l => _t1.includes(l)) ? 'Tier 1'
-                                : newTypes.some(l => _t2.includes(l)) ? 'Tier 2'
-                                : newTypes.length > 0 ? 'Tier 3' : '';
-                              setEntryRaw(p => ({ ...p, liquidity_type: newTypes, liquidity_tier: derivedTier }));
+                              toggleArr('liquidity_type', item);
+                              set('liquidity_tier', col.tier);
                             }}
                               className={`w-full text-left px-2 py-1.5 rounded border text-xs cursor-pointer transition-colors leading-tight ${
                                 active ? 'border-blue-500 bg-blue-900/60 text-blue-100 ring-1 ring-blue-500 ring-inset' :
@@ -4033,7 +4000,7 @@ function BacktestLogTab() {
                 <SumRow label="Pair / Direction" val={`${entry.pair} ${entry.direction}`}/>
                 <SumRow label="Date / Session" val={`${entry.date} · ${entry.session}`}/>
                 <SumRow label="Sequence" val={entry.sequence_type}/>
-                <SumRow label="Model" val={entry.model_type||null}/>
+                <SumRow label="Model" val={(entry.model_type||[]).join(', ')}/>
                 <SumRow label="Liquidity Tier" val={entry.liquidity_tier}/>
                 <SumRow label="Sweep Quality" val={entry.sweep_quality}/>
                 <SumRow label="Displacement" val={entry.displacement_quality ? `${entry.displacement_quality} · ${entry.structure_confirmation}` : null}/>
