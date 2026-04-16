@@ -6,6 +6,12 @@ const SUPABASE_URL      = 'https://nqwkcenrzlllkbjnclnb.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_7vQBgE8Wx0bzlgHEkl5sJA_9A1esyZO';
 const supabase          = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ─── ANTHROPIC API ────────────────────────────────────────────────────
+// WARNING: Never expose production API keys in client-side code.
+// Use an environment variable (e.g. import.meta.env.VITE_ANTHROPIC_KEY)
+// or a Supabase Edge Function proxy for production deployments.
+const ANTHROPIC_API_KEY = import.meta.env?.VITE_ANTHROPIC_KEY || '';
+
 async function compressImage(base64Str) {
   return new Promise((resolve) => {
     const img = new Image();
@@ -125,7 +131,7 @@ const EMPTY = {
   failType:"", firstLeg:false, secondLeg:false, bosStatus:"",
   entryIdea:"", entryAtOrigin:"", ltfConfirm:"", demandBelow50:false,
   stopPips:"", riskPct:"", estRR:"",
-  mgmtState:"NONE", m1Shift:false, intBOS:false,
+  mgmtState:"NONE", mgmtMode:"", m1Shift:false, intBOS:false,
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -817,18 +823,22 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
   const insertEvaluation = async () => {
     setEvalLogging(true);
     setEvalLogged(false);
-    const failedStep = Object.keys(S).includes("FAIL")
-      ? ["POI","TIME","LIQ","INDUCE","DISP","FAIL","BOS","RIFC"].find(s => ev.results[s]?.s === S.FAIL)
-      : null;
+    const failedStep = ["POI","TIME","LIQ","INDUCE","DISP","FAIL","BOS","RIFC"].find(s => ev.results[s]?.s === S.FAIL) || null;
+    const tradeDate  = inp.backtestMode && inp.backtestDate
+      ? inp.backtestDate
+      : new Date().toISOString().split('T')[0];
     const { error } = await supabase.from("evaluations").insert({
       evaluation_result: "NO TRADE",
-      failed_at:         failedStep || null,
+      failed_at:         failedStep,
       pair:              inp.pair        || null,
+      direction:         inp.direction   || null,
+      model:             inp.setupType   || null,
       setup_type:        inp.setupType   || null,
       session:           inp.session     || null,
       htf_bias:          inp.htfBias     || null,
       grade:             ev.grade        || null,
       reason:            ev.decReason    || null,
+      trade_date:        tradeDate,
       evaluated_at:      new Date().toISOString(),
     });
     setEvalLogging(false);
@@ -1286,6 +1296,38 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
           <Panel>
             <SH>Trade Management</SH>
             <div className="space-y-3">
+              {/* Mode A / Mode B selector with gate */}
+              {(()=>{
+                const grade      = computeAdaptiveGrade(inp, journal);
+                const modeAOk    = grade === 'A+' || inp.secondLeg === true;
+                const [mgmtMode, setMgmtMode] = [inp.mgmtMode || '', v => set('mgmtMode', v)];
+                return (
+                  <div>
+                    <FL>Management Mode</FL>
+                    <div className="grid grid-cols-2 gap-1.5 mb-1.5">
+                      <button
+                        onClick={() => { if (modeAOk) setMgmtMode('A'); }}
+                        disabled={!modeAOk}
+                        className={`py-2.5 rounded border text-xs font-bold transition-colors cursor-pointer ${
+                          !modeAOk           ? 'border-gray-800 text-gray-700 cursor-not-allowed bg-gray-950'   :
+                          mgmtMode === 'A'   ? 'border-green-600 bg-green-950/30 text-green-300'               :
+                                              'border-gray-700 text-gray-400 hover:border-green-900'
+                        }`}>Mode A — Full Runner</button>
+                      <button
+                        onClick={() => setMgmtMode('B')}
+                        className={`py-2.5 rounded border text-xs font-bold cursor-pointer transition-colors ${
+                          mgmtMode === 'B' ? 'border-blue-600 bg-blue-950/30 text-blue-300' :
+                                            'border-gray-700 text-gray-400 hover:border-blue-900'
+                        }`}>Mode B — Partials</button>
+                    </div>
+                    {!modeAOk && (
+                      <div className="text-xs border border-yellow-900 bg-yellow-950/20 text-yellow-600 rounded px-2 py-1.5">
+                        Mode A requires A+ grade or confirmed second leg. Select Mode B.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               <div><FL>Active State</FL>
                 <Sel value={inp.mgmtState} onChange={v=>set("mgmtState",v)} placeholder="— Select State —"
                   options={[["ENTRY","Entry — Initial"],["CONFIRMATION","Confirmation — Awaiting Structure"],["CONTINUATION","Continuation — Protected"]]}/>
@@ -1546,9 +1588,11 @@ function LiveModeTab({ onSaveToJournal }) {
     : poiDir==="bullish" ? "Bullish Reversal — push to demand, inducement swept" : "";
 
   // ── DXY check ─────────────────────────────────────────────────────
-  const tradePairs      = pairs.filter(p => p !== "DXY");
-  const dxyAllUnaligned = tradePairs.length > 0 && tradePairs.every(p => dxyCorr[p] === false);
-  const dxyAllAssessed  = tradePairs.length === 0 || tradePairs.every(p => dxyCorr[p] !== undefined);
+  const tradePairs       = pairs.filter(p => p !== "DXY");
+  // Hard gate: ANY assessed pair that is NOT aligned blocks progression
+  const dxyAnyConflict   = tradePairs.some(p => dxyCorr[p] === false);
+  const dxyAllUnaligned  = tradePairs.length > 0 && tradePairs.every(p => dxyCorr[p] === false);
+  const dxyAllAssessed   = tradePairs.length === 0 || tradePairs.every(p => dxyCorr[p] !== undefined);
 
   // ── Pipeline helpers ───────────────────────────────────────────────
   const advancePipe = () => { if (!blocked) setPipeStage(s => s + 1); };
@@ -1845,15 +1889,23 @@ function LiveModeTab({ onSaveToJournal }) {
                   ))}
                 </div>
               )}
-              {dxyAllUnaligned
-                ? <button onClick={()=>blockPipe("DXY not correlating with any selected pair. No valid setup right now. Wait for DXY to realign with your pairs before committing to any trade direction.")}
-                    className="w-full py-1.5 text-xs border border-red-800 bg-red-950/20 text-red-400 rounded cursor-pointer">
-                    ✗ None aligned — stand down
-                  </button>
-                : <button onClick={()=>{ if(dxyAllAssessed) advancePipe(); }} disabled={!dxyAllAssessed}
+              {dxyAnyConflict
+                ? (
+                  <div className="space-y-2">
+                    <div className="border border-red-800 bg-red-950/20 rounded px-3 py-2 text-xs text-red-400 leading-relaxed">
+                      🔴 DXY conflict detected. Bias not aligned. Do not proceed.
+                    </div>
+                    <button onClick={()=>blockPipe("DXY conflict detected. Bias not aligned. Do not proceed.")}
+                      className="w-full py-1.5 text-xs border border-red-800 bg-red-950/20 text-red-400 rounded cursor-pointer">
+                      ✗ Confirm block — stand down
+                    </button>
+                  </div>
+                ) : (
+                  <button onClick={()=>{ if(dxyAllAssessed) advancePipe(); }} disabled={!dxyAllAssessed}
                     className={`w-full py-1.5 text-xs rounded border cursor-pointer ${
                       dxyAllAssessed ? "border-green-700 bg-green-950/30 text-green-400 hover:bg-green-950/50" : "border-gray-800 text-gray-700 cursor-not-allowed"
                     }`}>Confirm DXY Correlation →</button>
+                )
               }
             </Panel>
           )}
@@ -2532,7 +2584,8 @@ function AnalyticsTab({ journal }) {
   const wr = decided>0 ? Math.round(wins/decided*100) : null;
   const totalR = journal.reduce((s,t)=>s+(parseFloat(t.rAchieved)||0),0);
 
-  const StatsTable = ({title, data}) => {
+  const MIN_RELIABLE_N = 30;
+  const StatsTable = ({title, data, showSampleWarning=false}) => {
     const entries = Object.entries(data).sort((a,b)=>b[1].n-a[1].n);
     if (!entries.length) return null;
     return (
@@ -2543,6 +2596,7 @@ function AnalyticsTab({ journal }) {
             const wr = s.winRate!==null ? Math.round(s.winRate*100) : null;
             const isWeak = wr!==null && s.n>=3 && wr<45;
             const isStrong = wr!==null && s.n>=3 && wr>75;
+            const smallSample = showSampleWarning && s.n < MIN_RELIABLE_N;
             return (
               <div key={key} className={`flex items-center gap-2 px-3 py-1.5 rounded border text-xs ${isWeak?"border-red-900 bg-red-950/10":isStrong?"border-green-900 bg-green-950/10":"border-gray-800"}`}>
                 <div className={`flex-shrink-0 w-2 h-2 rounded-full ${isWeak?"bg-red-500":isStrong?"bg-green-500":"bg-gray-600"}`}></div>
@@ -2554,6 +2608,7 @@ function AnalyticsTab({ journal }) {
                 <div className={`${s.avgR!==null&&s.avgR>0?"text-green-600":"text-red-600"}`}>
                   {s.avgR!==null?`${s.avgR>0?"+":""}${s.avgR.toFixed(1)}R avg`:""}
                 </div>
+                {smallSample && <div className="text-xs text-yellow-800 border border-yellow-900 rounded px-1 shrink-0">⚠ &lt;30</div>}
               </div>
             );
           })}
@@ -2611,7 +2666,7 @@ function AnalyticsTab({ journal }) {
           </div>
         )}
 
-        <StatsTable title="By Setup Type"  data={stats.bySetupType}/>
+        <StatsTable title="By Setup Type"  data={stats.bySetupType} showSampleWarning={true}/>
         <StatsTable title="By Session"     data={stats.bySession}/>
         <StatsTable title="By Trap Clarity" data={stats.byTrapClarity}/>
         <StatsTable title="By LTF Confirm" data={stats.byLtfConfirm}/>
@@ -2759,6 +2814,7 @@ const BL_EMPTY = {
   result: '', r_achieved: '', exit_reason: '', trade_grade: '',
   rule_triggered: [], warning_signal_present: null, warning_signal_acted_on: null, failed_at_stage: [],
   price_context: '', execution_notes: '', key_takeaway: '', chart_screenshot_url: '',
+  counterfactual_notes: '',
 };
 
 // ─── BacktestLogTab ───────────────────────────────────────────────────
@@ -2779,9 +2835,10 @@ function BacktestLogTab() {
   const [imgError,     setImgError]      = useState('');
   const [validationErrors, setValidationErrors] = useState({});
   // ── Paste-to-pre-fill (Phase 0A) ─────────────────────────────────
-  const [pasteOpen,   setPasteOpen]   = useState(false);
-  const [pasteText,   setPasteText]   = useState('');
-  const [parseResult, setParseResult] = useState(null); // { filled:[], blank:[], count:n }
+  const [pasteOpen,    setPasteOpen]   = useState(false);
+  const [pasteText,    setPasteText]   = useState('');
+  const [parseResult,  setParseResult] = useState(null); // { filled:[], blank:[], count:n, error?:string }
+  const [parseLoading, setParseLoading] = useState(false);
 
   const set       = (k, v) => setEntryRaw(p => ({ ...p, [k]: v }));
   const toggleArr = (k, v) => setEntryRaw(p => {
@@ -2859,6 +2916,19 @@ function BacktestLogTab() {
       set('stop_distance_pips', (Math.abs(ep - sp) * 10000).toFixed(1));
     }
   }, [entry.entry_price, entry.stop_price]);
+
+  // Auto-populate Target Description from EP + SL + RR
+  // Format: "TP at [price]" — only sets when all 3 inputs are valid numbers
+  useEffect(() => {
+    const ep = parseFloat(entry.entry_price);
+    const sp = parseFloat(entry.stop_price);
+    const rr = parseFloat(entry.target_rr);
+    if (!isNaN(ep) && !isNaN(sp) && !isNaN(rr) && ep > 0 && sp > 0 && rr > 0) {
+      // Works for both longs (ep > sp → positive offset) and shorts (ep < sp → negative offset)
+      const tp = ep + rr * (ep - sp);
+      set('target_description', `TP at ${tp.toFixed(5)}`);
+    }
+  }, [entry.entry_price, entry.stop_price, entry.target_rr]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Derived gate flags
   const showS4       = ['Double Sweep', 'Complex Pullback', 'Multi-Stage Engineered Reversal'].includes(entry.sequence_type);
@@ -3004,276 +3074,162 @@ function BacktestLogTab() {
     if (!error) { setCfTarget(null); loadRecentLogs(); }
   };
 
-  // ── Paste-to-pre-fill parser ──────────────────────────────────────
-  const parsePaste = () => {
-    const t = pasteText;
-    if (!t.trim()) return;
-    const merged = {};
-    const filled = [];
+  // ── Paste-to-pre-fill parser (Claude API) ────────────────────────
+  const PARSER_SYSTEM_PROMPT = `You are a trading journal parser for WTA-1. Extract the following fields from the Discord recap text and return ONLY a valid JSON object with no preamble or markdown. If a field cannot be determined return null for that field. Fields to extract: { date: string (DD/MM/YYYY format), pair: string (EURUSD or GBPUSD only), direction: string (Buy or Sell only), session: string (Frankfurt | London Open | NY 1st Hr | NY 2nd Hr | LDN Lunch | NY PM | Outside), htf_bias: string (Bullish | Bearish | Neutral), bias_aligned: boolean, model_type: string (Bull Rev | Bear Rev | Bull Cont | Bear Cont | Eng Rev | Eng Cont), model_status: string (Active | Pending | Invalid), sequence_type: string (Single Sweep | Double Sweep | Eng. Cont. | Complex PB | Multi-Stage), entry_price: number, stop_price: number, target_rr: number, target_description: string, result: string (Win | Loss | BE | No Trade), r_achieved: number, exit_reason: string (Target Hit | Stop Hit | Manual | BE), trade_grade: string (A+ | A | B | No Trade), execution_notes: string, key_takeaway: string, price_context: string }`;
 
-    const trySet = (key, val) => {
-      if (val !== null && val !== undefined && val !== '' && !(Array.isArray(val) && val.length === 0)) {
-        merged[key] = val;
-        if (!filled.includes(key)) filled.push(key);
+  const parsePaste = async () => {
+    const rawText = pasteText;
+    if (!rawText.trim()) return;
+    setParseLoading(true);
+
+    try {
+      if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set. Add VITE_ANTHROPIC_KEY to your .env file.');
+
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1024,
+          system: PARSER_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: rawText }],
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        throw new Error(`Claude API error ${res.status}: ${errBody.slice(0, 200)}`);
       }
-    };
 
-    // Date — YYYY-MM-DD or DD/MM/YYYY or DD-MM-YYYY
-    const dateM = t.match(/\b(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})\b/) ||
-                  t.match(/date\s*[:=]?\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/i);
-    if (dateM) {
-      const raw = dateM[1]; const pts = raw.split(/[-\/]/);
-      if (pts.length === 3) {
-        const [a,b,c] = pts;
-        const norm = a.length === 4
-          ? `${a}-${b.padStart(2,'0')}-${c.padStart(2,'0')}`
-          : c.length === 4 ? `${c}-${a.padStart(2,'0')}-${b.padStart(2,'0')}`
-          : raw;
-        trySet('date', norm);
+      const apiData = await res.json();
+      const jsonText = apiData.content?.[0]?.text || '';
+
+      let parsed;
+      try {
+        const clean = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+        parsed = JSON.parse(clean);
+      } catch {
+        throw new Error('Claude returned non-JSON. Check API key and model name.');
       }
+
+      // ── Map API response → form fields ───────────────────────────
+      const merged = {};
+      const filled = [];
+      const trySet = (key, val) => {
+        if (val !== null && val !== undefined && val !== '' && !(Array.isArray(val) && val.length === 0)) {
+          merged[key] = val;
+          if (!filled.includes(key)) filled.push(key);
+        }
+      };
+
+      // date: DD/MM/YYYY → YYYY-MM-DD
+      if (parsed.date) {
+        const parts = String(parsed.date).split('/');
+        if (parts.length === 3) {
+          const [dd, mm, yyyy] = parts;
+          trySet('date', `${yyyy}-${mm.padStart(2,'0')}-${dd.padStart(2,'0')}`);
+        }
+      }
+
+      // pair: EURUSD | GBPUSD — direct, single value only
+      if (parsed.pair === 'EURUSD' || parsed.pair === 'GBPUSD') trySet('pair', parsed.pair);
+
+      // direction: Buy → Long, Sell → Short
+      if      (parsed.direction === 'Buy')  trySet('direction', 'Long');
+      else if (parsed.direction === 'Sell') trySet('direction', 'Short');
+
+      // session
+      const SESSION_MAP = {
+        'Frankfurt':   'Frankfurt',
+        'London Open': 'London',
+        'NY 1st Hr':   'NY 1st Hour',
+        'NY 2nd Hr':   'NY 2nd Hour',
+        'LDN Lunch':   'London Lunch',
+        'NY PM':       'NY After Lunch',
+        'Outside':     'Outside',
+      };
+      if (parsed.session && SESSION_MAP[parsed.session]) trySet('session', SESSION_MAP[parsed.session]);
+
+      // htf_bias: Bullish | Bearish | Neutral
+      if (['Bullish','Bearish','Neutral'].includes(parsed.htf_bias)) trySet('htf_bias', parsed.htf_bias);
+
+      // bias_aligned: boolean — only set when explicitly returned
+      if (parsed.bias_aligned === true || parsed.bias_aligned === false) trySet('bias_aligned', parsed.bias_aligned);
+
+      // model_type: abbreviated → full form (single selection)
+      const MODEL_MAP = {
+        'Bull Rev':  'Bullish Reversal',
+        'Bear Rev':  'Bearish Reversal',
+        'Bull Cont': 'Bullish Continuation',
+        'Bear Cont': 'Bearish Continuation',
+        'Eng Rev':   'Engineered Reversal',
+        'Eng Cont':  'Engineered Continuation',
+      };
+      if (parsed.model_type && MODEL_MAP[parsed.model_type]) trySet('model_type', MODEL_MAP[parsed.model_type]);
+
+      // model_status: Active | Pending | Invalid
+      if (['Active','Pending','Invalid'].includes(parsed.model_status)) trySet('model_status', parsed.model_status);
+
+      // sequence_type
+      const SEQ_MAP = {
+        'Single Sweep': 'Single Sweep',
+        'Double Sweep': 'Double Sweep',
+        'Eng. Cont.':   'Engineered Continuation',
+        'Complex PB':   'Complex Pullback',
+        'Multi-Stage':  'Multi-Stage Engineered Reversal',
+      };
+      if (parsed.sequence_type && SEQ_MAP[parsed.sequence_type]) trySet('sequence_type', SEQ_MAP[parsed.sequence_type]);
+
+      // numeric fields → strings for form inputs
+      if (parsed.entry_price != null) trySet('entry_price', String(parsed.entry_price));
+      if (parsed.stop_price  != null) trySet('stop_price',  String(parsed.stop_price));
+      if (parsed.target_rr   != null) trySet('target_rr',   String(parsed.target_rr));
+
+      // target_description: direct
+      if (parsed.target_description) trySet('target_description', parsed.target_description);
+
+      // result: Win | Loss | BE → Break Even | No Trade
+      const RESULT_MAP = { 'Win':'Win', 'Loss':'Loss', 'BE':'Break Even', 'No Trade':'No Trade' };
+      if (parsed.result && RESULT_MAP[parsed.result]) trySet('result', RESULT_MAP[parsed.result]);
+
+      // r_achieved: number → string
+      if (parsed.r_achieved != null) trySet('r_achieved', String(parsed.r_achieved));
+
+      // exit_reason: Manual → Manual Close, BE → Break Even
+      const EXIT_MAP = { 'Target Hit':'Target Hit', 'Stop Hit':'Stop Hit', 'Manual':'Manual Close', 'BE':'Break Even' };
+      if (parsed.exit_reason && EXIT_MAP[parsed.exit_reason]) trySet('exit_reason', EXIT_MAP[parsed.exit_reason]);
+
+      // trade_grade: A+ | A | B | No Trade — direct
+      if (parsed.trade_grade) trySet('trade_grade', parsed.trade_grade);
+
+      // text fields: direct
+      if (parsed.execution_notes) trySet('execution_notes', parsed.execution_notes);
+      if (parsed.key_takeaway)    trySet('key_takeaway',    parsed.key_takeaway);
+      if (parsed.price_context)   trySet('price_context',   parsed.price_context);
+
+      // ── Finalise ─────────────────────────────────────────────────
+      const KEY_FIELDS_CHK = ['date','pair','direction','session','htf_bias','model_type',
+        'sequence_type','entry_price','stop_price','result','trade_grade',
+        'execution_notes','key_takeaway','price_context'];
+      const blank = KEY_FIELDS_CHK.filter(f => !filled.includes(f));
+
+      setParseResult({ filled, blank, count: filled.length });
+      setEntryRaw(prev => ({ ...prev, ...merged }));
+      setPasteOpen(false);
+      // pasteText intentionally NOT cleared — text persists for reference
+      setStep(0);
+
+    } catch (err) {
+      console.error('parsePaste error:', err);
+      setParseResult({ filled: [], blank: [], count: 0, error: err.message });
+    } finally {
+      setParseLoading(false);
     }
-
-    // Pair
-    if (/eurusd/i.test(t))      trySet('pair', 'EURUSD');
-    else if (/gbpusd/i.test(t)) trySet('pair', 'GBPUSD');
-
-    // Direction
-    if      (/\b(long|buy)\b/i.test(t))   trySet('direction', 'Long');
-    else if (/\b(short|sell)\b/i.test(t)) trySet('direction', 'Short');
-
-    // Session — order matters (most specific first)
-    if      (/london\s*lunch/i.test(t))                           trySet('session', 'London Lunch');
-    else if (/frankfurt/i.test(t))                                trySet('session', 'Frankfurt');
-    else if (/ny\s*(after\s*lunch|pm)\b/i.test(t))               trySet('session', 'NY After Lunch');
-    else if (/ny\s*1\s*pm/i.test(t))                             trySet('session', 'NY After Lunch');
-    else if (/ny\s*(2nd|second)\s*hour/i.test(t))                trySet('session', 'NY 2nd Hour');
-    else if (/ny\s*(1st|first)\s*hour/i.test(t))                 trySet('session', 'NY 1st Hour');
-    else if (/\blondon\b/i.test(t))                              trySet('session', 'London');
-
-    // HTF Bias
-    const biasM = t.match(/(?:htf\s*)?bias\s*[:=]?\s*(bullish|bearish)/i);
-    if (biasM) trySet('htf_bias', biasM[1].charAt(0).toUpperCase() + biasM[1].slice(1).toLowerCase());
-
-    // Bias aligned
-    const alignM = t.match(/bias\s*(not\s*)?aligned/i);
-    if (alignM) trySet('bias_aligned', !/not\s/i.test(alignM[0]));
-
-    // Model type (array)
-    const modelMap = [
-      [/bullish\s*reversal/i,        'Bullish Reversal'],
-      [/bearish\s*reversal/i,        'Bearish Reversal'],
-      [/bullish\s*continuation/i,    'Bullish Continuation'],
-      [/bearish\s*continuation/i,    'Bearish Continuation'],
-      [/engineered\s*reversal/i,     'Engineered Reversal'],
-      [/engineered\s*continuation/i, 'Engineered Continuation'],
-    ];
-    const models = modelMap.filter(([r]) => r.test(t)).map(([,v]) => v);
-    if (models.length) trySet('model_type', models[0]);
-
-    // Sequence type
-    if      (/multi.?stage/i.test(t))        trySet('sequence_type', 'Multi-Stage Engineered Reversal');
-    else if (/double\s*sweep/i.test(t))      trySet('sequence_type', 'Double Sweep');
-    else if (/complex\s*pullback/i.test(t))  trySet('sequence_type', 'Complex Pullback');
-    else if (/single\s*sweep/i.test(t))      trySet('sequence_type', 'Single Sweep');
-
-    // Sweep quality — BUG-005: explicit label first, then natural-language phrases
-    const swM = t.match(/sweep\s*(?:quality\s*)?[:=]?\s*(clean|induced|partial)/i)
-      || t.match(/\b(clean)\s*(?:sweep|break|wick)\b/i)
-      || t.match(/\b(partial)\s*(?:sweep|fill|wick)\b/i)
-      || t.match(/\b(induced)\s*(?:sweep|entry|move)\b/i);
-    if (swM) trySet('sweep_quality', swM[1].charAt(0).toUpperCase() + swM[1].slice(1).toLowerCase());
-
-    // Sweep distance — BUG-005: catch pip values adjacent to sweep language
-    const swDistM = t.match(/sweep\s*distance\s*[:=]?\s*(\d+\.?\d*)/i)
-      || t.match(/(?:swept?|wick(?:ed)?|ran|extended?)\s+(?:\w+\s+){0,3}?(\d+\.?\d*)\s*(?:pips?|pts?)\b/i)
-      || t.match(/(\d+\.?\d*)\s*(?:pips?|pts?)\s*(?:sweep|wick|extension|below|above|through)/i);
-    if (swDistM) trySet('sweep_distance_pips', swDistM[1]);
-
-    // Displacement quality
-    const dqM = t.match(/disp(?:lacement)?\s*(?:quality\s*)?[:=]?\s*(strong|moderate|weak)/i);
-    if (dqM) trySet('displacement_quality', dqM[1].charAt(0).toUpperCase() + dqM[1].slice(1).toLowerCase());
-
-    // Displacement confirmed
-    if (/displace\w*\s*[:=]?\s*(?:confirmed|yes)\b/i.test(t)) trySet('displacement_confirmed', true);
-
-    // CHoCH / BOS — structure_confirmation + choch_or_bos
-    if      (/\bchoch\b/i.test(t)) { trySet('structure_confirmation', 'CHoCH'); trySet('choch_or_bos', 'CHoCH'); }
-    else if (/\bbos\b/i.test(t))   { trySet('structure_confirmation', 'BOS');   trySet('choch_or_bos', 'BOS');   }
-
-    // LTF confirmation
-    if      (/m1\s*choch/i.test(t)) trySet('ltf_confirmation', 'M1 CHoCH');
-    else if (/m1\s*bos/i.test(t))   trySet('ltf_confirmation', 'M1 BOS');
-    else if (/engulf/i.test(t))     trySet('ltf_confirmation', 'Engulf');
-
-    // POI type
-    if      (/\bhtf\s*(?:poi|zone|demand|supply)\b/i.test(t)) trySet('poi_type', 'HTF');
-    else if (/\bltf\s*(?:poi|zone|demand|supply)\b/i.test(t)) trySet('poi_type', 'LTF');
-
-    // Inducement confirmed
-    if (/induce\w*\s*[:=]?\s*(?:confirmed|yes)\b/i.test(t)) trySet('inducement_confirmed', true);
-
-    // Full sequence complete
-    if (/full\s*sequence\s*(?:[:=]?\s*)(?:complete|yes|confirmed)\b/i.test(t)) trySet('full_sequence_complete', true);
-
-    // Entry price — forex decimal format
-    const epM = t.match(/entry\s*(?:price\s*)?[:=]?\s*([\d]{1,2}\.[\d]{3,5})\b/i);
-    if (epM) trySet('entry_price', epM[1]);
-
-    // Stop price
-    const spM = t.match(/(?:stop|sl|s\.l\.)\s*(?:price\s*)?[:=]?\s*([\d]{1,2}\.[\d]{3,5})\b/i);
-    if (spM) trySet('stop_price', spM[1]);
-
-    // Target RR
-    const rrM = t.match(/(?:target\s*(?:rr|r\/r)|rr\s*[:=]|1\s*:\s*)([0-9]+\.?[0-9]*)/i);
-    if (rrM) trySet('target_rr', rrM[1]);
-
-    // R achieved — signed notation preferred (+6.5R / -1R), fallback to explicit label
-    const rAchM = t.match(/([+-][\d]+\.?[\d]*)\s*R\b/i)
-      || t.match(/r\s*achieved\s*[:=]\s*([+-]?[\d]+\.?[\d]*)/i)
-      || t.match(/result\s*[:=]\s*([+-]?[\d]+\.?[\d]*)\s*R\b/i);
-    if (rAchM) trySet('r_achieved', rAchM[1]);
-
-    // Result
-    if      (/\bno\s*trade\b/i.test(t))                     trySet('result', 'No Trade');
-    else if (/\b(loss|lost|loser)\b/i.test(t))              trySet('result', 'Loss');
-    else if (/\b(break\s*even|b\.?e\.?)\b/i.test(t))        trySet('result', 'Break Even');
-    else if (/\bwin\b/i.test(t))                             trySet('result', 'Win');
-
-    // Trade grade
-    const grM = t.match(/grade\s*[:=]?\s*(A\+|A|B)\b/i);
-    if (grM) trySet('trade_grade', grM[1].toUpperCase() === 'A+' ? 'A+' : grM[1].toUpperCase());
-
-    // Liquidity type (array) + tier inference
-    // BUG-005: expanded with natural-language Discord variants
-    const liqMap = [
-      [/weekly\s*high/i,                          'Weekly High'],
-      [/weekly\s*low/i,                           'Weekly Low'],
-      [/\bPDH\b/,                                 'PDH'],
-      [/\bPDL\b/,                                 'PDL'],
-      [/\bPDC\b/,                                 'PDC'],
-      [/prev(?:ious)?\s*day\s*high/i,             'PDH'],   // "previous day high"
-      [/prev(?:ious)?\s*day\s*low/i,              'PDL'],   // "previous day low"
-      [/prev(?:ious)?\s*day\s*close/i,            'PDC'],   // "previous day close"
-      [/daily\s*open/i,                           'Daily Open'],
-      [/asian?\s*(?:session\s*)?high/i,           'Asia High'],  // "Asian high" / "Asia high"
-      [/asian?\s*(?:session\s*)?low/i,            'Asia Low'],
-      [/asian?\s*(?:session\s*)?open/i,           'Asia Open'],
-      [/frankfurt\s*high/i,                       'Frankfurt High'],
-      [/frankfurt\s*low/i,                        'Frankfurt Low'],
-      [/london\s*(?:open\s*)?high/i,              'London Open High'],
-      [/london\s*(?:open\s*)?low/i,               'London Open Low'],
-      [/\bny\s*open\s*high/i,                     'NY Open High'],
-      [/\bny\s*open\s*low/i,                      'NY Open Low'],
-      [/kill\s*zone\s*high/i,                     'Kill Zone High'],
-      [/kill\s*zone\s*low/i,                      'Kill Zone Low'],
-      [/session\s*high/i,                         'Session High'],
-      [/session\s*low/i,                          'Session Low'],
-      [/(?:equal|eq\.?)\s*high/i,                 'Equal Highs'],  // "EQ high" / "equal high"
-      [/(?:equal|eq\.?)\s*low/i,                  'Equal Lows'],
-      [/\bHOPD\b/,                                'HOPD'],
-      [/\bHOPW\b/,                                'HOPW'],
-      [/trendline\s*liq/i,                        'Trendline Liquidity'],
-      [/trendline\s*(?:sweep|swept|level)/i,      'Trendline Liquidity'], // "trendline swept"
-      [/internal\s*liq/i,                         'Internal Liquidity'],
-      [/swing\s*high/i,                           'Swing High'],
-      [/swing\s*low/i,                            'Swing Low'],
-      [/smc\s*trap/i,                             'SMC Trap Zone'],
-      [/induced\s*ob/i,                           'Induced OB'],
-    ];
-    const liqFound = liqMap.filter(([r]) => r.test(t)).map(([,v]) => v);
-    if (liqFound.length) {
-      trySet('liquidity_type', liqFound);
-      const t1 = ['Weekly High','Weekly Low','PDH','PDL','PDC','Daily Open'];
-      const t2 = ['Asia High','Asia Low','Asia Open','London Open High','London Open Low',
-                  'Frankfurt High','Frankfurt Low','Session High','Session Low',
-                  'Kill Zone High','Kill Zone Low'];
-      if      (liqFound.some(l => t1.includes(l))) trySet('liquidity_tier', 'Tier 1');
-      else if (liqFound.some(l => t2.includes(l))) trySet('liquidity_tier', 'Tier 2');
-      else                                          trySet('liquidity_tier', 'Tier 3');
-    }
-
-    // ── Key takeaway — verbatim if explicitly labelled ─────────────────
-    const notesM = t.match(/(?:notes?|key\s*takeaway|takeaway)\s*[:=]?\s*([^\n]{10,})/i);
-    if (notesM) trySet('key_takeaway', notesM[1].trim().slice(0, 500));
-
-    // ── Structured notes builder ────────────────────────────────────────
-    // Build price_context and execution_notes from parsed fields only.
-    // Only include a sentence when its source data was actually parsed.
-    // Do NOT copy raw text. Do NOT infer missing values.
-    const ctx  = []; // price_context sentences
-    const exec = []; // execution_notes sentences
-
-    // price_context — HTF positioning, liquidity, bias, pre-session context
-    if (merged.pair && merged.direction)
-      ctx.push(`${merged.pair} ${merged.direction} trade.`);
-
-    if (merged.htf_bias) {
-      const alignStr = merged.bias_aligned === true  ? ', bias aligned'      :
-                       merged.bias_aligned === false ? ', bias NOT aligned'  : '';
-      ctx.push(`${merged.htf_bias} HTF bias${alignStr}.`);
-    }
-
-    if (liqFound.length > 0) {
-      const tierStr = merged.liquidity_tier ? ` (${merged.liquidity_tier})` : '';
-      ctx.push(`Liquidity targeted: ${liqFound.slice(0, 4).join(', ')}${tierStr}.`);
-    }
-
-    if (merged.sweep_quality)
-      ctx.push(`${merged.sweep_quality} sweep confirmed.`);
-
-    // Pre-session context — grab first clause mentioning Asia or Frankfurt if present
-    const preM = t.match(/(?:asia|frankfurt)\s+[^.!?\n]{10,60}/i);
-    if (preM) ctx.push(preM[0].trim().replace(/\s+/g, ' ') + '.');
-
-    // execution_notes — sequence, displacement, entry trigger, stop, result
-    if (merged.sequence_type)
-      exec.push(`Sequence: ${merged.sequence_type}.`);
-
-    if (merged.displacement_quality) {
-      const structStr = merged.structure_confirmation ? ` with ${merged.structure_confirmation}` : '';
-      exec.push(`${merged.displacement_quality} displacement confirmed${structStr}.`);
-    }
-
-    if (merged.ltf_confirmation && merged.ltf_confirmation !== 'None') {
-      const epStr = merged.entry_price ? ` at ${merged.entry_price}` : '';
-      exec.push(`Entry trigger: ${merged.ltf_confirmation}${epStr}.`);
-    }
-
-    if (merged.stop_price) {
-      const ep = parseFloat(merged.entry_price);
-      const sp = parseFloat(merged.stop_price);
-      const distStr = (!isNaN(ep) && !isNaN(sp))
-        ? ` (${(Math.abs(ep - sp) * 10000).toFixed(1)}p)` : '';
-      exec.push(`Stop: ${merged.stop_price}${distStr}.`);
-    }
-
-    if (merged.result) {
-      const rStr  = merged.r_achieved   ? ` ${merged.r_achieved}R`      : '';
-      const grStr = merged.trade_grade  ? ` [${merged.trade_grade}]`    : '';
-      exec.push(`Result: ${merged.result}${rStr}${grStr}.`);
-    }
-
-    // Write notes — require at least 2 sentences to be considered meaningful
-    // Fallback: raw recap text into price_context only if builder produces nothing
-    if (ctx.length >= 2)  trySet('price_context',    ctx.join('  '));
-    if (exec.length >= 2) trySet('execution_notes',  exec.join('  '));
-
-    if (!merged.price_context && t.trim().length > 30)
-      trySet('price_context', t.trim().slice(0, 800));   // raw fallback
-
-    // ── Finalise ────────────────────────────────────────────────────────
-    // blank = key fields not yet in the parsed set (used for initial display)
-    const KEY_FIELDS_CHK = ['date','pair','direction','session','htf_bias','model_type',
-      'sequence_type','liquidity_type','sweep_quality','displacement_quality',
-      'structure_confirmation','ltf_confirmation','entry_price','stop_price',
-      'result','trade_grade'];
-    const blank = KEY_FIELDS_CHK.filter(f => !filled.includes(f));
-
-    setParseResult({ filled, blank, count: filled.length });
-    setEntryRaw(prev => ({ ...prev, ...merged }));
-    setPasteOpen(false);
-    // pasteText intentionally NOT cleared — text persists for reference
-    setStep(0);
   };
 
   // ── Micro UI (scoped) ───────────────────────────────────────────────
@@ -3430,7 +3386,9 @@ function BacktestLogTab() {
         <div className="flex items-center gap-1.5 flex-wrap justify-end">
           {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override −8</span>}
           {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
-          {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+          {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 &&
+           (currentStep >= totalSteps - 1 || liveCompletion.done.length >= Math.ceil(KEY_FIELDS_LIVE.length * 0.9)) &&
+           <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
         </div>
       </div>
 
@@ -3538,16 +3496,18 @@ function BacktestLogTab() {
             <div className="flex gap-2 flex-wrap">
               <button
                 onClick={parsePaste}
-                disabled={!pasteText.trim()}
+                disabled={!pasteText.trim() || parseLoading}
                 className={`flex-1 py-2.5 text-xs rounded border font-bold uppercase tracking-wider cursor-pointer transition-colors ${
-                  pasteText.trim()
-                    ? 'border-blue-700 bg-blue-950/30 text-blue-300 hover:bg-blue-950/60'
-                    : 'border-gray-800 text-gray-700 cursor-not-allowed'
+                  parseLoading
+                    ? 'border-blue-900 bg-blue-950/20 text-blue-600 cursor-not-allowed'
+                    : pasteText.trim()
+                      ? 'border-blue-700 bg-blue-950/30 text-blue-300 hover:bg-blue-950/60'
+                      : 'border-gray-800 text-gray-700 cursor-not-allowed'
                 }`}
               >
-                {parseResult ? 'Re-parse & Update →' : 'Parse & Pre-fill →'}
+                {parseLoading ? '⏳ Parsing with Claude…' : parseResult ? 'Re-parse & Update →' : '✦ Parse with Claude →'}
               </button>
-              {pasteText && (
+              {pasteText && !parseLoading && (
                 <button
                   onClick={() => setPasteText('')}
                   className="px-3 py-2.5 text-xs border border-gray-700 text-gray-600 rounded cursor-pointer hover:border-red-900 hover:text-red-500 transition-colors"
@@ -3557,11 +3517,18 @@ function BacktestLogTab() {
               )}
               <button
                 onClick={() => setPasteOpen(false)}
+                disabled={parseLoading}
                 className="px-3 py-2.5 text-xs border border-gray-700 text-gray-500 rounded cursor-pointer hover:border-gray-500 transition-colors"
               >
                 Close
               </button>
             </div>
+
+            {parseResult?.error && (
+              <div className="text-xs text-red-400 border border-red-900 bg-red-950/20 rounded px-3 py-2">
+                ❌ Parse error: {parseResult.error}
+              </div>
+            )}
 
             <div className="text-xs text-gray-800">
               Fields left blank are intentional — do not guess. Fill them in the steps below.
@@ -3634,6 +3601,31 @@ function BacktestLogTab() {
                   <TG opts={O.sess} val={entry.session} onSel={v=>set('session',v)} cols={4}/>
                 </div>
                 {validationErrors.session && <div className="mt-1 text-xs text-red-500">Required</div>}
+                {/* Session time validation warning */}
+                {(()=>{
+                  if (!entry.date || !entry.session || entry.session === 'Outside') return null;
+                  const SESSION_WINDOWS_BST = {
+                    'Frankfurt':     { start: 7*60+45,  end: 9*60 },
+                    'London':        { start: 8*60,      end: 12*60 },
+                    'NY 1st Hour':   { start: 13*60,     end: 14*60 },
+                    'NY 2nd Hour':   { start: 14*60,     end: 16*60 },
+                    'London Lunch':  { start: 12*60,     end: 14*60 },
+                    'NY After Lunch':{ start: 18*60,     end: 20*60 },
+                  };
+                  const win = SESSION_WINDOWS_BST[entry.session];
+                  if (!win) return null;
+                  const now    = new Date();
+                  const bstOff = 60; // BST = UTC+1 (approximate — DST adjustments ignored)
+                  const bstMin = now.getUTCHours() * 60 + now.getUTCMinutes() + bstOff;
+                  const inWindow = bstMin >= win.start && bstMin < win.end;
+                  if (inWindow) return null;
+                  const fmt = m => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')} BST`;
+                  return (
+                    <div className="mt-1 text-xs border border-yellow-900 bg-yellow-950/20 text-yellow-600 rounded px-2 py-1.5">
+                      ⚠ Current time appears outside the {entry.session} window ({fmt(win.start)}–{fmt(win.end)}). Verify the trade date and session before logging.
+                    </div>
+                  );
+                })()}
               </div>
               <div>
                 <div className={validationErrors.htf_bias ? 'ring-1 ring-red-500 rounded' : ''}>
@@ -3982,6 +3974,7 @@ function BacktestLogTab() {
               <div><FL>Price Context</FL><TA2 val={entry.price_context} onChg={v=>set('price_context',v)} ph="Where was price? What was the macro context?"/></div>
               <div><FL>Execution Notes</FL><TA2 val={entry.execution_notes} onChg={v=>set('execution_notes',v)} ph="How did you enter? Any hesitation?"/></div>
               <div><FL>Key Takeaway</FL><TA2 val={entry.key_takeaway} onChg={v=>set('key_takeaway',v)} ph="What did this trade teach you?"/></div>
+              <div><FL>Counterfactual</FL><TA2 val={entry.counterfactual_notes} onChg={v=>set('counterfactual_notes',v)} ph="What did price do after your exit? Did the original target get hit? What would the outcome have been if you had held?"/></div>
               <div>
                 <FL>Chart Screenshot</FL>
                 {entry.chart_screenshot_url ? (
@@ -4034,7 +4027,7 @@ function BacktestLogTab() {
                 <SumRow label="Date / Session" val={`${entry.date} · ${entry.session}`}/>
                 <SumRow label="Sequence" val={entry.sequence_type}/>
                 <SumRow label="Model" val={entry.model_type||null}/>
-                <SumRow label="Liquidity Tier" val={entry.liquidity_tier}/>
+                <SumRow label="Liquidity Tier" val={entry.liquidity_tier ? ({'Tier 1':'Tier 1 (Macro)','Tier 2':'Tier 2 (Intra-day)','Tier 3':'Tier 3 (Internal)'}[entry.liquidity_tier] || entry.liquidity_tier) : null}/>
                 <SumRow label="Sweep Quality" val={entry.sweep_quality}/>
                 <SumRow label="Displacement" val={entry.displacement_quality ? `${entry.displacement_quality} · ${entry.structure_confirmation}` : null}/>
                 <SumRow label="Inducement" val={(entry.inducement_type||[]).join(', ')||null}/>
