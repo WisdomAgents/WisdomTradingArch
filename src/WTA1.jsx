@@ -122,7 +122,7 @@ const STEP_NAME = { POI:"Point of Interest", TIME:"Session / Timing", LIQ:"Liqui
   BOS:"BOS / CHoCH", RIFC:"RIFC Entry" };
 
 const EMPTY = {
-  pair:"EURUSD", setupType:"", session:"", htfBias:"", rangeLoc:"", backtestMode:false, backtestDate:"",
+  pair:"EURUSD", setupType:"", direction:"", session:"", htfBias:"", rangeLoc:"", backtestMode:false, backtestDate:"",
   poiLocation:"", poiSizePips:"", poiType:"htf",
   m5Build:false, m5Ind:false, m5Push:false,
   liquidityType:[], multiLayerTrap:false,
@@ -132,7 +132,53 @@ const EMPTY = {
   entryIdea:"", entryAtOrigin:"", ltfConfirm:"", demandBelow50:false,
   stopPips:"", riskPct:"", estRR:"",
   mgmtState:"NONE", mgmtMode:"", m1Shift:false, intBOS:false,
+  // ── Precision validation (7 mandatory fields) ──
+  rifcPipSize:"", rifcTimeframe:"",
+  eqlSweepDistance:"", eqhSweepDistance:"",
+  opposingZoneExists:false, opposingZoneStatus:"",
+  dxyStructureDetail:"",
 };
+
+// ─── LABEL MAP ───────────────────────────────────────────────────────
+// Single source of truth: raw form key → human-readable Supabase label.
+// Every value written to Supabase must use these labels, not the raw keys.
+const LABEL_MAP = {
+  // Setup types
+  reversal_bull: 'Bullish Reversal',    reversal_bear: 'Bearish Reversal',
+  cont_bull:     'Bullish Continuation', cont_bear:    'Bearish Continuation',
+  // Sessions
+  london:        'London',              frankfurt:     'Frankfurt',
+  ny1pm:         'NY 1PM',             ny2:           'NY 2nd Hour',
+  ny2pm:         'NY 2nd Hour',        asia:          'Asia',
+  london_lunch:  'London Lunch',       ny_lunch:      'NY After Lunch',
+  outside:       'Outside Window',
+  // HTF Bias
+  bullish:       'Bullish',            bearish:       'Bearish',
+  // Outcomes
+  win:           'Win',                loss:          'Loss',
+  be:            'Break Even',         valid_not_taken:'Valid -- Not Taken',
+  // Liquidity types
+  eq_high:       'Equal Highs',        eq_low:        'Equal Lows',
+  sess_high:     'Session High',       sess_low:      'Session Low',
+  hopd:          'HOPD',               hopw:          'High of Previous Week',
+  trendline:     'Trendline Liquidity',
+  internal:      'Internal Liquidity',
+  frankfurt_h:   'Frankfurt High ✦',   frankfurt_l:   'Frankfurt Low ✦',
+  london_h:      'London High ✦',      london_l:      'London Low ✦',
+  smc_trap:      'SMC Trap Zone ✦',    swing_hl:      'Swing Highs & Lows',
+  unclear:       'Unclear',
+  // Opposing zone
+  fresh:         'Fresh',              spent:         'Spent',
+  // RIFC timeframes (keys and labels are identical — kept for completeness)
+  M1: 'M1', M2: 'M2', M3: 'M3', M5: 'M5',
+};
+
+// Human-readable label lookups for the 7 precision-validation fields.
+// Supabase inserts MUST use these labels — never the raw keys.
+const RIFC_TF_LABELS         = { M1:"M1", M2:"M2", M3:"M3", M5:"M5" };
+const OPPOSING_ZONE_LABELS   = { fresh:"Fresh", spent:"Spent" };
+const OUTCOME_LABELS         = { win:"Win", loss:"Loss", be:"Break Even", valid_not_taken:"Valid -- Not Taken" };
+const DXY_REQUIRED_PAIRS     = ["EURUSD","GBPUSD"];
 
 // ═══════════════════════════════════════════════════════════════════════
 // EVALUATION ENGINE  (identical logic to v2)
@@ -324,8 +370,8 @@ function computeStats(trades) {
       const k = String(key);
       if (!obj[k]) obj[k]={ n:0, wins:0, losses:0, be:0, totalR:0 };
       obj[k].n++;
-      if (t.outcome==="win") obj[k].wins++;
-      else if (t.outcome==="loss") obj[k].losses++;
+      if (t.outcome==="Win") obj[k].wins++;
+      else if (t.outcome==="Loss") obj[k].losses++;
       else obj[k].be++;
       obj[k].totalR += (parseFloat(t.rAchieved)||0);
     };
@@ -815,7 +861,32 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
   const isCont = inp.setupType?.startsWith("cont");
   const isRev  = inp.setupType?.startsWith("reversal");
   const [showSave, setShowSave] = useState(false);
-  const [saveForm, setSaveForm] = useState({ outcome:"win", rAchieved:"", notes:"", images:[] });
+  const [saveForm, setSaveForm] = useState({ outcome:"win", rAchieved:"", notes:"", images:[], whyNotTaken:"" });
+
+  // ── Precision-validation gating ─────────────────────────────────────
+  // Fields 1–5 are mandatory whenever visible.
+  // Field 6 (DXY Structure Detail) is mandatory for EURUSD / GBPUSD.
+  // Field 7 (Why Not Taken) is mandatory when outcome = Valid -- Not Taken.
+  const missingRequired = useMemo(() => {
+    const miss = [];
+    const pipSize = parseFloat(inp.rifcPipSize);
+    if (inp.rifcPipSize === "" || isNaN(pipSize))       miss.push("RIFC Pip Size");
+    else if (pipSize < 0.1 || pipSize > 5.0)            miss.push("RIFC Pip Size (must be 0.1–5.0)");
+    if (!inp.rifcTimeframe)                             miss.push("RIFC Timeframe");
+    else if (!["M1","M2","M3","M5"].includes(inp.rifcTimeframe))
+                                                        miss.push("RIFC Timeframe (M1–M5 only)");
+    if (inp.eqlSweepDistance === "" || isNaN(parseFloat(inp.eqlSweepDistance)))
+                                                        miss.push("EQL Sweep Distance");
+    if (inp.eqhSweepDistance === "" || isNaN(parseFloat(inp.eqhSweepDistance)))
+                                                        miss.push("EQH Sweep Distance");
+    if (inp.opposingZoneExists && !inp.opposingZoneStatus)
+                                                        miss.push("Opposing Zone Status");
+    if (DXY_REQUIRED_PAIRS.includes((inp.pair||"").toUpperCase()) && !inp.dxyStructureDetail?.trim())
+                                                        miss.push("DXY Structure Detail");
+    if (saveForm.outcome === "valid_not_taken" && !saveForm.whyNotTaken?.trim())
+                                                        miss.push("Why Not Taken");
+    return miss;
+  }, [inp, saveForm.outcome, saveForm.whyNotTaken]);
   const [lightbox, setLightbox] = useState(null);
   const [evalLogging, setEvalLogging] = useState(false);
   const [evalLogged,  setEvalLogged]  = useState(false);
@@ -840,6 +911,18 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
       reason:            ev.decReason    || null,
       trade_date:        tradeDate,
       evaluated_at:      new Date().toISOString(),
+      // ── Precision-validation fields (human-readable labels) ──
+      rifc_pip_size:        (inp.rifcPipSize === "" || inp.rifcPipSize == null)
+                              ? null : parseFloat(inp.rifcPipSize),
+      rifc_timeframe:       RIFC_TF_LABELS[inp.rifcTimeframe] || inp.rifcTimeframe || null,
+      eql_sweep_distance:   (inp.eqlSweepDistance === "" || inp.eqlSweepDistance == null)
+                              ? null : parseFloat(inp.eqlSweepDistance),
+      eqh_sweep_distance:   (inp.eqhSweepDistance === "" || inp.eqhSweepDistance == null)
+                              ? null : parseFloat(inp.eqhSweepDistance),
+      opposing_zone_status: inp.opposingZoneExists
+                              ? (OPPOSING_ZONE_LABELS[inp.opposingZoneStatus] || inp.opposingZoneStatus || null)
+                              : null,
+      dxy_structure_detail: (inp.dxyStructureDetail || '').trim() || null,
     });
     setEvalLogging(false);
     if (!error) setEvalLogged(true);
@@ -884,6 +967,10 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
             {inp.setupType==="reversal_bear"&&<div className="text-xs text-red-900 bg-red-950/30 border border-red-900 rounded px-2 py-1.5 leading-relaxed">Complex push → supply tap → violent rejection → No HH → BOS → RIFC</div>}
             {inp.setupType==="cont_bull"&&<div className="text-xs text-blue-900 bg-blue-950/30 border border-blue-900 rounded px-2 py-1.5 leading-relaxed">Displacement → demand BELOW 50% → SMC traps above → BOS → expansion</div>}
             {inp.setupType==="cont_bear"&&<div className="text-xs text-orange-900 bg-orange-950/30 border border-orange-900 rounded px-2 py-1.5 leading-relaxed">Displacement → supply ABOVE 50% → SMC traps below → BOS → expansion</div>}
+            <div><FL>Direction</FL>
+              <Sel value={inp.direction} onChange={v=>set("direction",v)} placeholder="— Long / Short —"
+                options={[["Long","↑ Long"],["Short","↓ Short"]]}/>
+            </div>
             <div><FL>Pair</FL><Inp value={inp.pair} onChange={v=>set("pair",v)} placeholder="EURUSD"/></div>
           </div>
         </Panel>
@@ -1113,6 +1200,115 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
           </div>
         </Panel>
 
+        {/* ───────── PRECISION VALIDATION (7 mandatory fields) ───────── */}
+        <Panel>
+          <SH>Precision Validation</SH>
+          <div className="space-y-2.5">
+            {/* 1 — RIFC Pip Size */}
+            <div>
+              <FL>RIFC Pip Size (pips)</FL>
+              <Inp
+                type="number"
+                value={inp.rifcPipSize}
+                onChange={v=>set("rifcPipSize",v)}
+                placeholder="0.1 – 5.0"
+              />
+              {inp.rifcPipSize!=="" && !isNaN(parseFloat(inp.rifcPipSize)) && parseFloat(inp.rifcPipSize) > 5.0 && (
+                <div className="mt-1 text-xs text-red-400 bg-red-950/30 border border-red-900 rounded px-2 py-1">
+                  ⚠ RIFC too large -- maximum 5 pips
+                </div>
+              )}
+              {inp.rifcPipSize!=="" && !isNaN(parseFloat(inp.rifcPipSize)) && parseFloat(inp.rifcPipSize) < 0.1 && (
+                <div className="mt-1 text-xs text-yellow-400 bg-yellow-950/30 border border-yellow-900 rounded px-2 py-1">
+                  ⚠ RIFC too small -- minimum 0.1 pips
+                </div>
+              )}
+            </div>
+
+            {/* 2 — RIFC Timeframe */}
+            <div>
+              <FL>RIFC Timeframe</FL>
+              <Sel
+                value={inp.rifcTimeframe}
+                onChange={v=>set("rifcTimeframe",v)}
+                placeholder="— Timeframe —"
+                options={[["M1","M1"],["M2","M2"],["M3","M3"],["M5","M5"]]}
+              />
+              {inp.rifcTimeframe && !["M1","M2","M3","M5"].includes(inp.rifcTimeframe) && (
+                <div className="mt-1 text-xs text-red-400 bg-red-950/30 border border-red-900 rounded px-2 py-1">
+                  ⚠ RIFC must be drawn on M1-M5 only
+                </div>
+              )}
+            </div>
+
+            {/* 3 — EQL Sweep Distance */}
+            <div>
+              <FL>EQL Sweep Distance (pips)</FL>
+              <Inp
+                type="number"
+                value={inp.eqlSweepDistance}
+                onChange={v=>set("eqlSweepDistance",v)}
+                placeholder="pips from EQL to wick extreme"
+              />
+              <div className="mt-1 text-xs text-gray-600 leading-relaxed">
+                Measured from the liquidity level to the extreme of the wick on the timeframe the level was identified.
+              </div>
+            </div>
+
+            {/* 4 — EQH Sweep Distance */}
+            <div>
+              <FL>EQH Sweep Distance (pips)</FL>
+              <Inp
+                type="number"
+                value={inp.eqhSweepDistance}
+                onChange={v=>set("eqhSweepDistance",v)}
+                placeholder="pips from EQH to wick extreme"
+              />
+              <div className="mt-1 text-xs text-gray-600 leading-relaxed">
+                Same measurement rule as EQL — logged separately, never combined with the EQL field.
+              </div>
+            </div>
+
+            {/* 5 — Opposing Zone Status (only shown when opposing zone exists) */}
+            <div>
+              <Chk
+                checked={inp.opposingZoneExists}
+                onChange={v=>{ set("opposingZoneExists",v); if(!v) set("opposingZoneStatus",""); }}
+                label="Opposing zone exists in target path"
+              />
+              {inp.opposingZoneExists && (
+                <div className="mt-2">
+                  <FL>Opposing Zone Status</FL>
+                  <Sel
+                    value={inp.opposingZoneStatus}
+                    onChange={v=>set("opposingZoneStatus",v)}
+                    placeholder="— Zone Status —"
+                    options={[["fresh","Fresh"],["spent","Spent"]]}
+                  />
+                  {inp.opposingZoneStatus==="spent" && (
+                    <div className="mt-1 text-xs text-orange-400 bg-orange-950/30 border border-orange-900 rounded px-2 py-1 leading-relaxed">
+                      Spent zone -- acting as liquidity trap, not genuine demand/supply
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 6 — DXY Structure Detail */}
+            <div>
+              <FL>DXY Structure Detail{DXY_REQUIRED_PAIRS.includes((inp.pair||"").toUpperCase()) && <span className="text-red-500"> *</span>}</FL>
+              <Inp
+                value={inp.dxyStructureDetail}
+                onChange={v=>set("dxyStructureDetail",v)}
+                placeholder="e.g. Swept Asia High, engineered HH, displaced down -- inverse confirms bearish EU"
+              />
+              {DXY_REQUIRED_PAIRS.includes((inp.pair||"").toUpperCase()) && !inp.dxyStructureDetail?.trim() && (
+                <div className="mt-1 text-xs text-red-400">Mandatory for {(inp.pair||"").toUpperCase()} trades.</div>
+              )}
+            </div>
+          </div>
+        </Panel>
+
         <button onClick={()=>set("setupType","")&&setShowSave(false)&&Object.entries(EMPTY).forEach(([k,v])=>set(k,v))||setInp&&setInp(EMPTY)}
           className="w-full bg-transparent hover:bg-gray-900 border border-gray-800 text-gray-600 py-2 rounded uppercase tracking-widest text-xs cursor-pointer"
           onClick={()=>{Object.entries(EMPTY).forEach(([k,v])=>set(k,v));}}>
@@ -1219,8 +1415,22 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
             <div className="space-y-2.5">
               <div><FL>Outcome</FL>
                 <Sel value={saveForm.outcome} onChange={v=>setSaveForm(p=>({...p,outcome:v}))} placeholder=""
-                  options={[["win","Win"],["loss","Loss"],["be","Break Even"]]}/>
+                  options={[["win","Win"],["loss","Loss"],["be","Break Even"],["valid_not_taken","Valid -- Not Taken"]]}/>
               </div>
+              {/* 7 — Why Not Taken (only when outcome = Valid -- Not Taken) */}
+              {saveForm.outcome === "valid_not_taken" && (
+                <div>
+                  <FL>Why Not Taken <span className="text-red-500">*</span></FL>
+                  <Inp
+                    value={saveForm.whyNotTaken}
+                    onChange={v=>setSaveForm(p=>({...p,whyNotTaken:v}))}
+                    placeholder="e.g. Missed entry window, risk already allocated, conflicting HTF bias…"
+                  />
+                  {!saveForm.whyNotTaken?.trim() && (
+                    <div className="mt-1 text-xs text-red-400">Mandatory when outcome is Valid -- Not Taken.</div>
+                  )}
+                </div>
+              )}
               <div><FL>R Achieved</FL>
                 <Inp type="number" value={saveForm.rAchieved} onChange={v=>setSaveForm(p=>({...p,rAchieved:v}))} placeholder="e.g. 6.5"/>
               </div>
@@ -1246,13 +1456,44 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
                   </div>
                 )}
               </div>
+              {/* Missing-required-fields gate */}
+              {missingRequired.length > 0 && (
+                <div className="text-xs text-red-400 bg-red-950/30 border border-red-900 rounded px-2.5 py-2 leading-relaxed">
+                  <div className="font-bold uppercase tracking-wider mb-1">Cannot save — missing mandatory fields:</div>
+                  <ul className="list-disc pl-5 space-y-0.5">
+                    {missingRequired.map(f => <li key={f}>{f}</li>)}
+                  </ul>
+                </div>
+              )}
               <div className="flex gap-2">
-                <button onClick={()=>{
-                  const savedAt=inp.backtestMode&&inp.backtestDate?new Date(inp.backtestDate).toISOString():new Date().toISOString();
-                  const pipelineSnapshot=Object.fromEntries(Object.entries(ev.results||{}).map(([k,v])=>([k,{s:v.s,r:v.r}])));
-                  addTrade({...inp,outcome:saveForm.outcome,rAchieved:parseFloat(saveForm.rAchieved)||0,notes:saveForm.notes,grade:ev.grade,savedAt,isBacktest:inp.backtestMode,images:saveForm.images,pipelineSnapshot});
-                  setShowSave(false); setSaveForm({outcome:"win",rAchieved:"",notes:"",images:[]});
-                }} className="flex-1 bg-green-950 hover:bg-green-900 border border-green-800 text-green-400 py-1.5 rounded text-xs cursor-pointer">Save Trade</button>
+                <button
+                  disabled={missingRequired.length > 0}
+                  onClick={()=>{
+                    if (missingRequired.length > 0) return;
+                    const savedAt=inp.backtestMode&&inp.backtestDate?new Date(inp.backtestDate).toISOString():new Date().toISOString();
+                    const pipelineSnapshot=Object.fromEntries(Object.entries(ev.results||{}).map(([k,v])=>([k,{s:v.s,r:v.r}])));
+                    addTrade({
+                      ...inp,
+                      outcome:saveForm.outcome,
+                      rAchieved:parseFloat(saveForm.rAchieved)||0,
+                      notes:saveForm.notes,
+                      whyNotTaken:saveForm.whyNotTaken,
+                      grade:ev.grade,
+                      savedAt,
+                      isBacktest:inp.backtestMode,
+                      images:saveForm.images,
+                      pipelineSnapshot,
+                    });
+                    setShowSave(false);
+                    setSaveForm({outcome:"win",rAchieved:"",notes:"",images:[],whyNotTaken:""});
+                  }}
+                  className={`flex-1 border py-1.5 rounded text-xs ${
+                    missingRequired.length > 0
+                      ? "bg-gray-950 border-gray-800 text-gray-600 cursor-not-allowed"
+                      : "bg-green-950 hover:bg-green-900 border-green-800 text-green-400 cursor-pointer"
+                  }`}>
+                  Save Trade
+                </button>
                 <button onClick={()=>setShowSave(false)} className="px-4 bg-gray-900 border border-gray-700 text-gray-500 py-1.5 rounded text-xs cursor-pointer">Cancel</button>
               </div>
             </div>
@@ -1273,9 +1514,9 @@ function EvaluateTab({ inp, set, ev, disc, discEval, mgmt, addTrade, journal }) 
             <SH>Similar Past Trades ({similar.length} match{similar.length!==1?"es":""})</SH>
             <div className="space-y-2">
               {similar.map((t,i)=>(
-                <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded border ${t.outcome==="win"?"border-green-900 bg-green-950/10":t.outcome==="loss"?"border-red-900 bg-red-950/10":"border-gray-800"}`}>
-                  <div className={`font-bold text-sm ${t.outcome==="win"?"text-green-400":t.outcome==="loss"?"text-red-400":"text-gray-500"}`}>
-                    {t.outcome==="win"?"W":t.outcome==="loss"?"L":"BE"}
+                <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded border ${t.outcome==="Win"?"border-green-900 bg-green-950/10":t.outcome==="Loss"?"border-red-900 bg-red-950/10":"border-gray-800"}`}>
+                  <div className={`font-bold text-sm ${t.outcome==="Win"?"text-green-400":t.outcome==="Loss"?"text-red-400":"text-gray-500"}`}>
+                    {t.outcome==="Win"?"W":t.outcome==="Loss"?"L":"BE"}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="text-gray-300 text-xs">{t.setupType?.replace("_"," ")} | {t.session} | {t.trapClarity} trap | {t.ltfConfirm||"no LTF"}</div>
@@ -2357,7 +2598,7 @@ function JournalTab({ journal, setJournal, journalLoading, journalError, livePre
       <Panel>
         <SH>Trade Journal ({journal.length} trade{journal.length!==1?"s":""})</SH>
         <div className="flex gap-2 mb-3 flex-wrap">
-          {[["","All"],["reversal_bull","Bull Rev"],["reversal_bear","Bear Rev"],["cont_bull","Bull Cont"],["cont_bear","Bear Cont"],["win","Wins"],["loss","Losses"],["be","BE"]].map(([v,l])=>(
+          {[["","All"],["reversal_bull","Bull Rev"],["reversal_bear","Bear Rev"],["cont_bull","Bull Cont"],["cont_bear","Bear Cont"],["Win","Wins"],["Loss","Losses"],["Break Even","BE"]].map(([v,l])=>(
             <button key={v} onClick={()=>setFilter(v)}
               className={`px-2.5 py-1 rounded text-xs border cursor-pointer transition-colors ${filter===v?"border-green-700 text-green-400":"border-gray-700 text-gray-500 hover:border-gray-600"}`}>
               {l}
@@ -2380,12 +2621,12 @@ function JournalTab({ journal, setJournal, journalLoading, journalError, livePre
 
         <div className="space-y-2">
           {filtered.map(t=>(
-            <div key={t.id} className={`border rounded-sm p-3 ${t.outcome==="win"?"border-green-900":t.outcome==="loss"?"border-red-900":"border-gray-800"}`}>
+            <div key={t.id} className={`border rounded-sm p-3 ${t.outcome==="Win"?"border-green-900":t.outcome==="Loss"?"border-red-900":"border-gray-800"}`}>
               {/* Header row */}
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`font-bold text-sm ${t.outcome==="win"?"text-green-400":t.outcome==="loss"?"text-red-400":"text-gray-500"}`}>
-                    {t.outcome==="win"?"W":t.outcome==="loss"?"L":"BE"}
+                  <span className={`font-bold text-sm ${t.outcome==="Win"?"text-green-400":t.outcome==="Loss"?"text-red-400":"text-gray-500"}`}>
+                    {t.outcome==="Win"?"W":t.outcome==="Loss"?"L":"BE"}
                   </span>
                   <span className={`font-bold text-xs ${parseFloat(t.rAchieved)>0?"text-green-500":parseFloat(t.rAchieved)<0?"text-red-500":"text-gray-500"}`}>
                     {parseFloat(t.rAchieved)>0?"+":""}{t.rAchieved}R
@@ -2473,14 +2714,7 @@ function JournalTab({ journal, setJournal, journalLoading, journalError, livePre
                       {/* Liquidity */}
                       <div className="border-b border-gray-800/60 pb-2">
                         <div className="text-gray-500 uppercase tracking-widest mb-1.5">Liquidity</div>
-                        <div className="text-gray-400">{Array.isArray(t.liquidityType)&&t.liquidityType.length>0?t.liquidityType.map(k=>({
-                          eq_high:'Equal Highs', eq_low:'Equal Lows',
-                          sess_high:'Session High', sess_low:'Session Low',
-                          hopd:'Prev Day High', lopd:'Prev Day Low',
-                          frankfurt_h:'Frankfurt High', frankfurt_l:'Frankfurt Low',
-                          swing_hl:'Swing Highs and Lows', trendline:'Trendline Liquidity',
-                          internal:'Internal Liquidity', smc_trap:'SMC Trap Zone',
-                        }[k]||k)).join(", "):"—"}</div>
+                        <div className="text-gray-400">{t.liquidity||"—"}</div>
                         {t.multiLayerTrap&&<div className="text-green-700 mt-0.5">✦ Multi-layer trap</div>}
                       </div>
                       {/* Trap Story */}
@@ -2577,9 +2811,9 @@ function AnalyticsTab({ journal }) {
   }, []);
 
   const total = journal.length;
-  const wins  = journal.filter(t=>t.outcome==="win").length;
-  const losses= journal.filter(t=>t.outcome==="loss").length;
-  const be    = journal.filter(t=>t.outcome==="be").length;
+  const wins  = journal.filter(t=>t.outcome==="Win").length;
+  const losses= journal.filter(t=>t.outcome==="Loss").length;
+  const be    = journal.filter(t=>t.outcome==="Break Even").length;
   const decided = wins+losses;
   const wr = decided>0 ? Math.round(wins/decided*100) : null;
   const totalR = journal.reduce((s,t)=>s+(parseFloat(t.rAchieved)||0),0);
@@ -3094,7 +3328,7 @@ function BacktestLogTab() {
           'anthropic-dangerous-direct-browser-access': 'true',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 1024,
           system: PARSER_SYSTEM_PROMPT,
           messages: [{ role: 'user', content: rawText }],
@@ -4271,10 +4505,12 @@ export default function WTA1() {
       : (Array.isArray(trade.images) ? trade.images : []);
     const compressed = await Promise.all(rawScreenshots.map(s => compressImage(s)));
 
-    // Derive direction from htfBias if not explicitly set
+    // Use explicitly entered direction (Long / Short).
+    // Only fall back to htfBias derivation when direction is genuinely absent
+    // (e.g. old Live Mode saves that predate the direction field).
     const direction = trade.direction ||
-      (trade.htfBias === 'bearish' ? 'SHORT' :
-       trade.htfBias === 'bullish' ? 'LONG' : '');
+      (trade.htfBias === 'bearish' ? 'Short' :
+       trade.htfBias === 'bullish' ? 'Long' : '');
 
     // Robust trade_date: use backtestDate for backtests, else today
     const tradeDate = (() => {
@@ -4319,56 +4555,44 @@ export default function WTA1() {
 
     const payload = {
       pair:        trade.pair        || '',
-      setup:       (() => {
-        const raw = trade.setupType || trade.setup || '';
-        return { reversal_bull:'Bullish Reversal', reversal_bear:'Bearish Reversal',
-                 cont_bull:'Bullish Continuation', cont_bear:'Bearish Continuation' }[raw] || raw;
-      })(),
-      session:     (() => {
-        const raw = trade.session || '';
-        return { london:'London', frankfurt:'Frankfurt', ny1pm:'NY 1PM', ny2:'NY 2nd Hour',
-                 ny2pm:'NY 2nd Hour', asia:'Asia', london_lunch:'London Lunch',
-                 ny_lunch:'NY After Lunch', outside:'Outside Window' }[raw] || raw;
-      })(),
-      htf_bias:    (() => {
-        const raw = trade.htfBias || '';
-        return { bullish:'Bullish', bearish:'Bearish' }[raw] || raw;
-      })(),
+      setup:       (LABEL_MAP[trade.setupType || trade.setup || ''] || trade.setupType || trade.setup || ''),
+      session:     (LABEL_MAP[trade.session || ''] || trade.session || ''),
+      htf_bias:    (LABEL_MAP[trade.htfBias || ''] || trade.htfBias || ''),
       direction,
       poi:         trade.poiLocation || trade.poi    || '',
       liquidity:   (() => {
-        const liqLabels = {
-          eq_high:    'Equal Highs',        eq_low:     'Equal Lows',
-          sess_high:  'Session High',       sess_low:   'Session Low',
-          hopd:       'HOPD',               hopw:       'HOPW',
-          trendline:  'Trendline Liquidity',
-          internal:   'Internal Liquidity',
-          frankfurt_h:'Frankfurt High ✦',   frankfurt_l:'Frankfurt Low ✦',
-          london_h:   'London Open High ✦', london_l:   'London Open Low ✦',
-          smc_trap:   'SMC Trap Zone ✦',    swing_hl:   'Swing Highs & Lows',
-        };
         if (Array.isArray(trade.liquidityType) && trade.liquidityType.length > 0)
-          return trade.liquidityType.map(k => liqLabels[k] || k).join(', ');
+          return trade.liquidityType.map(k => LABEL_MAP[k] || k).join(', ');
         return trade.liquidity || '';
       })(),
       model:       (() => {
         const raw = trade.model || trade.setupType || trade.selectedModel || trade.setup || '';
-        const modelLabels = {
-          reversal_bull: 'Bullish Reversal',
-          reversal_bear: 'Bearish Reversal',
-          cont_bull:     'Bullish Continuation',
-          cont_bear:     'Bearish Continuation',
-        };
-        return modelLabels[raw] || raw;
+        return LABEL_MAP[raw] || raw;
       })(),
       grade:       trade.grade       || '',
-      outcome:     trade.outcome     || '',
+      outcome:     OUTCOME_LABELS[trade.outcome] || trade.outcome || '',
       r_achieved:  parseFloat(trade.rAchieved) || 0,
       notes:       trade.notes       || '',
       pipeline:    pipelineBlob,
       screenshots: compressed,
       trade_date:  tradeDate,
+      // ── 7 precision-validation fields, saved as human-readable labels ──
+      rifc_pip_size:        (trade.rifcPipSize === "" || trade.rifcPipSize == null)
+                              ? null : parseFloat(trade.rifcPipSize),
+      rifc_timeframe:       RIFC_TF_LABELS[trade.rifcTimeframe] || trade.rifcTimeframe || null,
+      eql_sweep_distance:   (trade.eqlSweepDistance === "" || trade.eqlSweepDistance == null)
+                              ? null : parseFloat(trade.eqlSweepDistance),
+      eqh_sweep_distance:   (trade.eqhSweepDistance === "" || trade.eqhSweepDistance == null)
+                              ? null : parseFloat(trade.eqhSweepDistance),
+      opposing_zone_status: trade.opposingZoneExists
+                              ? (OPPOSING_ZONE_LABELS[trade.opposingZoneStatus] || trade.opposingZoneStatus || null)
+                              : null,
+      dxy_structure_detail: (trade.dxyStructureDetail || '').trim() || null,
+      why_not_taken:        (trade.outcome === 'valid_not_taken')
+                              ? ((trade.whyNotTaken || '').trim() || null)
+                              : null,
     };
+    console.log('[trades insert payload]', payload);
     const { data, error } = await supabase
       .from('trades')
       .insert([payload])
