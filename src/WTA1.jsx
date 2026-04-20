@@ -3032,6 +3032,143 @@ function sqsBand(score) {
   return               { grade:'F',  label:'Auto NO TRADE.',                                color:'text-red-500',    ring:'border-red-700'    };
 }
 
+// ─── 5-PHASE EVALUATION ENGINE ───────────────────────────────────────
+// Returns { p1, p2, p3, p4, p5, total, autoGrade, phaseDetails }
+function calculatePhaseScores(e) {
+  const isCont = e.model_type === 'Bullish Continuation' || e.model_type === 'Bearish Continuation';
+  const isRev  = e.model_type === 'Bullish Reversal'     || e.model_type === 'Bearish Reversal';
+
+  // ── Phase 1: HTF Structure Confirmation (0–20 pts) ──────────────
+  let p1 = 0;
+  const p1Details = [];
+  if (isCont) {
+    // 4 checkpoints × 5 pts each = 20
+    if (e.p1_hh_ll_breaks_key)     { p1 += 5;  p1Details.push({ label:'HH/LL breaks key level', pass:true }); }
+    else                             p1Details.push({ label:'HH/LL breaks key level', pass:false });
+    if (e.p1_buildup_created)       { p1 += 5;  p1Details.push({ label:'Buildup / inducement after break', pass:true }); }
+    else                             p1Details.push({ label:'Buildup / inducement after break', pass:false });
+    if (e.p1_engineered_pullback)   { p1 += 5;  p1Details.push({ label:'Engineered pullback to demand/supply', pass:true }); }
+    else                             p1Details.push({ label:'Engineered pullback to demand/supply', pass:false });
+    if (e.p1_micro_poi_confirm)     { p1 += 5;  p1Details.push({ label:'Micro-POI tap + strong displacement', pass:true }); }
+    else                             p1Details.push({ label:'Micro-POI tap + strong displacement', pass:false });
+  } else if (isRev) {
+    // 3 checkpoints × ~6.67 pts → rounded: 7+7+6 = 20
+    if (e.p1_ll_hh_into_htf)       { p1 += 7;  p1Details.push({ label:'LL/HH confirmed into HTF demand/supply', pass:true }); }
+    else                             p1Details.push({ label:'LL/HH confirmed into HTF demand/supply', pass:false });
+    if (e.p1_macro_liq_sweep)       { p1 += 7;  p1Details.push({ label:'Macro liquidity sweep (Tier 1)', pass:true }); }
+    else                             p1Details.push({ label:'Macro liquidity sweep (Tier 1)', pass:false });
+    if (e.p1_displacement_into_poi) { p1 += 6;  p1Details.push({ label:'Displacement into HTF POI', pass:true }); }
+    else                             p1Details.push({ label:'Displacement into HTF POI', pass:false });
+  } else {
+    // Unknown model — partial credit from existing data
+    if (e.displacement_quality === 'Strong') p1 += 10;
+    else if (e.displacement_quality === 'Moderate') p1 += 5;
+    p1Details.push({ label:'Model type needed for full Phase 1 eval', pass: false });
+  }
+
+  // ── Phase 2: Inducement + Sweep (0–20 pts) ───────────────────────
+  let p2 = 0;
+  const p2Details = [];
+  // Checkpoint 1 — internal liquidity created (via inducement_type)
+  const hasInducement = Array.isArray(e.inducement_type) && e.inducement_type.length > 0;
+  if (hasInducement) { p2 += 7; p2Details.push({ label:'Internal liquidity identified', pass:true }); }
+  else                 p2Details.push({ label:'Internal liquidity identified', pass:false });
+  // Checkpoint 2 — sweep quality (induced = 7pts, partial = 4pts, clean = 0pts continuation, clean = 6pts reversal)
+  const sweepDist = parseFloat(e.sweep_distance_pips) || 0;
+  const inducedSweep   = sweepDist >= 0.5 && sweepDist <= 2;
+  const trapSweep      = sweepDist >= 3   && sweepDist <= 15;
+  const contSweepOk    = isCont && inducedSweep;
+  const revSweepOk     = isRev  && trapSweep;
+  const sweepOk        = contSweepOk || revSweepOk || (!isCont && !isRev && e.sweep_quality === 'Induced');
+  if (sweepOk)         { p2 += 7; p2Details.push({ label:`Sweep distance valid (${sweepDist}p)`, pass:true }); }
+  else if (e.sweep_quality === 'Induced' || e.sweep_quality === 'Partial')
+                       { p2 += 3; p2Details.push({ label:`Sweep distance marginal (${sweepDist}p)`, pass:false }); }
+  else                   p2Details.push({ label:`Sweep quality/distance insufficient (${sweepDist}p)`, pass:false });
+  // Checkpoint 3 — sweep within 30 min of entry killzone
+  const killzoneSess = ['London','NY 1st Hour','NY 2nd Hour'].includes(e.session);
+  if (killzoneSess)    { p2 += 6; p2Details.push({ label:'Sweep in killzone session', pass:true }); }
+  else                   p2Details.push({ label:'Killzone session not confirmed', pass:false });
+
+  // ── Phase 3: Entry Trigger Confirmation (0–30 pts) ───────────────
+  let p3 = 0;
+  const p3Details = [];
+  // Checkpoint 1 — M1 CHoCH or BOS after sweep (10pts)
+  const hasLtfConfirm = e.ltf_confirmation === 'M1 CHoCH' || e.ltf_confirmation === 'M1 BOS';
+  if (hasLtfConfirm)   { p3 += 10; p3Details.push({ label:'M1 CHoCH / BOS confirmed', pass:true }); }
+  else                   p3Details.push({ label:'M1 CHoCH / BOS not confirmed', pass:false });
+  // Checkpoint 2 — Entry inside fresh POI or HTF retest (10pts)
+  const formationEntry = e.poi_type === 'HTF' && isCont;
+  const retestEntry    = e.poi_type === 'HTF' && isRev;
+  if (formationEntry || retestEntry || e.poi_type === 'HTF')
+                       { p3 += 10; p3Details.push({ label:`${isRev?'HTF retest':'Formation'} entry confirmed`, pass:true }); }
+  else if (e.poi_type === 'LTF')
+                       { p3 += 5;  p3Details.push({ label:'LTF POI entry (partial)', pass:false }); }
+  else                   p3Details.push({ label:'POI entry type needed', pass:false });
+  // Checkpoint 3 — Entry timing = killzone open (10pts)
+  const nyKZ       = e.session === 'NY 1st Hour' || e.session === 'NY 2nd Hour';
+  const londonKZ   = e.session === 'London';
+  if (nyKZ || londonKZ)
+                       { p3 += 10; p3Details.push({ label:`Killzone entry (${e.session})`, pass:true }); }
+  else                   p3Details.push({ label:'Entry outside killzone window', pass:false });
+
+  // ── Phase 4: Pre-Entry Strength Signal / A+ Upgrade (0–10 pts) ───
+  let p4 = 0;
+  const p4Details = [];
+  if (e.p4_micro_poi_present) { p4 = 10; p4Details.push({ label:'Micro-POI tap + displacement pre-entry', pass:true }); }
+  else                          p4Details.push({ label:'Pre-entry signal absent (optional)', pass:false });
+
+  // ── Phase 5: Exit Discipline (0–20 pts) ──────────────────────────
+  let p5 = 0;
+  const p5Details = [];
+  const rAch = parseFloat(e.r_achieved) || 0;
+  const rTgt = parseFloat(e.target_rr)  || 0;
+  const contMinR   = 10;
+  const revMinR    = 5;
+  const exitOk     = (isCont && rAch >= contMinR) ||
+                     (isRev  && rAch >= revMinR)  ||
+                     (e.exit_reason === 'Target Hit');
+  if (exitOk)       { p5 += 10; p5Details.push({ label:`Exit at target (${rAch}R achieved)`, pass:true }); }
+  else if (rAch > 0){ p5 += 5;  p5Details.push({ label:`Early exit — ${rAch}R (partial)`, pass:false }); }
+  else                p5Details.push({ label:'Exit result not yet logged', pass:false });
+  // Counterfactual logged
+  if (e.counterfactual_notes && e.counterfactual_notes.trim().length > 10)
+                     { p5 += 10; p5Details.push({ label:'Counterfactual logged', pass:true }); }
+  else               p5Details.push({ label:'Counterfactual not yet logged', pass:false });
+
+  const total = p1 + p2 + p3 + p4 + p5;
+
+  // ── Auto-grade assignment ─────────────────────────────────────────
+  let autoGrade = 'No Trade';
+  if (total >= 95 && p4 === 10) autoGrade = 'A+';
+  else if (total >= 85)         autoGrade = 'A+';
+  else if (total >= 70)         autoGrade = 'A';
+  else if (total >= 55)         autoGrade = 'B';
+  else                          autoGrade = 'No Trade';
+
+  // Phase PASS/FAIL gates override grade
+  const p1Pass = p1 >= 15; // ≥75% of 20
+  const p2Pass = p2 >= 14; // ≥70% of 20
+  const p3Pass = p3 >= 20; // ≥67% of 30
+  const p5Pass = p5 >= 10; // ≥50% of 20
+
+  if (!p1Pass || !p2Pass) autoGrade = 'No Trade';
+  else if (!p3Pass)        autoGrade = 'No Trade';
+  else if (!p5Pass && autoGrade === 'A+') autoGrade = 'A';
+
+  return {
+    p1, p2, p3, p4, p5, total, autoGrade,
+    p1Pass, p2Pass, p3Pass, p5Pass,
+    p1Details, p2Details, p3Details, p4Details, p5Details,
+  };
+}
+
+function phaseBand(grade) {
+  if (grade === 'A+')       return { color:'text-green-300',  ring:'border-green-700',  bg:'bg-green-950/20'  };
+  if (grade === 'A')        return { color:'text-green-500',  ring:'border-green-800',  bg:'bg-green-950/20'  };
+  if (grade === 'B')        return { color:'text-yellow-400', ring:'border-yellow-700', bg:'bg-yellow-950/20' };
+  return                           { color:'text-red-400',    ring:'border-red-800',    bg:'bg-red-950/20'    };
+}
+
 // ─── Blank entry template ─────────────────────────────────────────────
 const BL_EMPTY = {
   date: '',
@@ -3049,6 +3186,20 @@ const BL_EMPTY = {
   rule_triggered: [], warning_signal_present: null, warning_signal_acted_on: null, failed_at_stage: [],
   price_context: '', execution_notes: '', key_takeaway: '', chart_screenshot_url: '',
   counterfactual_notes: '',
+  // ── 5-Phase checkpoint fields ──────────────────────────────────────
+  // Phase 1 — HTF Structure (Continuation model)
+  p1_hh_ll_breaks_key:     false,
+  p1_buildup_created:       false,
+  p1_engineered_pullback:   false,
+  p1_micro_poi_confirm:     false,
+  // Phase 1 — HTF Structure (Reversal model)
+  p1_ll_hh_into_htf:        false,
+  p1_macro_liq_sweep:        false,
+  p1_displacement_into_poi:  false,
+  // Phase 4 — Pre-Entry Signal
+  p4_micro_poi_present:     false,
+  // Phase override reason
+  phase_override_reason: '',
 };
 
 // ─── BacktestLogTab ───────────────────────────────────────────────────
@@ -3187,6 +3338,9 @@ function BacktestLogTab() {
   const liveSQS  = useMemo(() => calculateSQS(entry), [entry]);
   const liveBand = sqsBand(liveSQS);
 
+  // Live 5-Phase scores
+  const livePhase = useMemo(() => calculatePhaseScores(entry), [entry]);
+
   // ── Live completion tracker — updates on every entry change ──────────
   const KEY_FIELDS_LIVE = [
     { key: 'date',                  label: 'Date'        , check: e => !!e.date },
@@ -3269,16 +3423,34 @@ function BacktestLogTab() {
 
   const doSave = async () => {
     setSaveState('saving'); setConfirmIncomplete(false);
-    const score = liveSQS;
+    const score     = liveSQS;
+    const phases    = calculatePhaseScores(entry);
     setSqsScore(score);
     const band  = sqsBand(score);
     const NUM   = ['sweep_distance_pips','poi_size_pips','entry_price','stop_price','stop_distance_pips','target_rr','r_achieved','displacement_body_ratio'];
+    // Bool checkpoint fields — must stay as booleans, not be nulled
+    const BOOL_PHASE = [
+      'p1_hh_ll_breaks_key','p1_buildup_created','p1_engineered_pullback','p1_micro_poi_confirm',
+      'p1_ll_hh_into_htf','p1_macro_liq_sweep','p1_displacement_into_poi','p4_micro_poi_present',
+    ];
     const payload = { ...entry };
     NUM.forEach(k => { const v = parseFloat(payload[k]); payload[k] = isNaN(v) ? null : v; });
-    Object.keys(payload).forEach(k => { if (payload[k] === '') payload[k] = null; });
+    Object.keys(payload).forEach(k => {
+      if (BOOL_PHASE.includes(k)) return; // keep booleans
+      if (payload[k] === '') payload[k] = null;
+    });
     delete payload.setup_played_out; delete payload.counterfactual_r; delete payload.decision_correct;
     payload.sqs_score           = score;
     payload.grade               = band.grade;
+    // ── 5-Phase scores ──────────────────────────────────────────────
+    payload.phase_1_score       = phases.p1;
+    payload.phase_2_score       = phases.p2;
+    payload.phase_3_score       = phases.p3;
+    payload.phase_4_score       = phases.p4;
+    payload.phase_5_score       = phases.p5;
+    payload.phase_total_score   = phases.total;
+    payload.auto_grade          = phases.autoGrade;
+    payload.grade_conflict      = entry.trade_grade && entry.trade_grade !== phases.autoGrade;
     payload.evaluated_at        = new Date().toISOString();
     payload.enrichment_complete = true;
     const { error } = await supabase.from('backtest_logs').insert(payload);
@@ -3289,7 +3461,7 @@ function BacktestLogTab() {
   const loadRecentLogs = async () => {
     const { data } = await supabase
       .from('backtest_logs')
-      .select('id,date,pair,direction,sequence_type,sqs_score,grade,result,setup_played_out,enrichment_complete,bias_aligned,second_sweep_override,chart_screenshot_url')
+      .select('id,date,pair,direction,sequence_type,sqs_score,grade,auto_grade,phase_total_score,grade_conflict,result,setup_played_out,enrichment_complete,bias_aligned,second_sweep_override,chart_screenshot_url')
       .order('evaluated_at', { ascending: false }).limit(20);
     if (data) setRecentLogs(data);
   };
@@ -3924,6 +4096,53 @@ function BacktestLogTab() {
                   {validationErrors.sequence_type && <div className="mt-1 text-xs text-red-500">Required</div>}
                 </div>
               </div>
+
+              {/* ── Phase 1 Checkpoints — appear once model is selected ── */}
+              {(entry.model_type === 'Bullish Continuation' || entry.model_type === 'Bearish Continuation') && (
+                <div className="border border-gray-800 rounded p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-500 uppercase tracking-widest">Phase 1 — HTF Structure</span>
+                    <span className={`text-xs font-bold ${livePhase.p1 >= 15 ? 'text-green-400' : livePhase.p1 >= 10 ? 'text-yellow-400' : 'text-red-400'}`}>{livePhase.p1}/20</span>
+                  </div>
+                  {[
+                    ['p1_hh_ll_breaks_key',   'HH/LL breaks key level (Asia/Session High/Low)'],
+                    ['p1_buildup_created',     'Buildup / inducement created after break'],
+                    ['p1_engineered_pullback', 'Engineered pullback to prior demand/supply (timestamp POI)'],
+                    ['p1_micro_poi_confirm',   'Demand/supply tap with strong displacement (micro-POI)'],
+                  ].map(([k, label]) => (
+                    <label key={k} className="flex items-start gap-2 cursor-pointer group">
+                      <input type="checkbox" checked={!!entry[k]} onChange={ev => set(k, ev.target.checked)}
+                        className="mt-0.5 accent-blue-500 shrink-0"/>
+                      <span className={`text-xs ${entry[k] ? 'text-gray-200' : 'text-gray-600'} group-hover:text-gray-400 transition-colors`}>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {(entry.model_type === 'Bullish Reversal' || entry.model_type === 'Bearish Reversal') && (
+                <div className="border border-gray-800 rounded p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-500 uppercase tracking-widest">Phase 1 — HTF Structure</span>
+                    <span className={`text-xs font-bold ${livePhase.p1 >= 15 ? 'text-green-400' : livePhase.p1 >= 10 ? 'text-yellow-400' : 'text-red-400'}`}>{livePhase.p1}/20</span>
+                  </div>
+                  {[
+                    ['p1_ll_hh_into_htf',        'LL/HH confirmed into HTF demand/supply zone'],
+                    ['p1_macro_liq_sweep',        'Macro liquidity sweep (Tier 1: PDH/PDL, Weekly, Asia)'],
+                    ['p1_displacement_into_poi',  'Displacement candle into HTF POI confirmed'],
+                  ].map(([k, label]) => (
+                    <label key={k} className="flex items-start gap-2 cursor-pointer group">
+                      <input type="checkbox" checked={!!entry[k]} onChange={ev => set(k, ev.target.checked)}
+                        className="mt-0.5 accent-blue-500 shrink-0"/>
+                      <span className={`text-xs ${entry[k] ? 'text-gray-200' : 'text-gray-600'} group-hover:text-gray-400 transition-colors`}>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {/* Phase 1 live feedback */}
+              {entry.model_type && (
+                <div className={`text-xs rounded px-3 py-2 border ${livePhase.p1Pass ? 'border-green-800 bg-green-950/20 text-green-400' : 'border-gray-800 text-gray-600'}`}>
+                  {livePhase.p1Pass ? `✓ Phase 1: ${livePhase.p1}/20 PASS — HTF structure confirmed` : `Phase 1: ${livePhase.p1}/20 — Complete checkpoints above`}
+                </div>
+              )}
             </div>
           )}
 
@@ -3972,6 +4191,15 @@ function BacktestLogTab() {
                 <FL>Sweep Distance (pips) <InfoTip content="Measure from the liquidity level to the extreme of the wick that swept it in pips. Measure on the same timeframe you identified the liquidity on"/></FL>
                 <NI val={entry.sweep_distance_pips} onChg={v=>set('sweep_distance_pips',v)} ph="e.g. 8.5"/>
               </div>
+              {/* Phase 2 live feedback */}
+              {(entry.sweep_quality || entry.sweep_distance_pips) && (
+                <div className={`text-xs rounded px-3 py-2 border ${livePhase.p2Pass ? 'border-green-800 bg-green-950/20 text-green-400' : livePhase.p2 >= 10 ? 'border-yellow-800 bg-yellow-950/20 text-yellow-400' : 'border-gray-800 text-gray-600'}`}>
+                  {livePhase.p2Pass
+                    ? `✓ Phase 2: ${livePhase.p2}/20 PASS — Inducement + sweep confirmed`
+                    : `Phase 2: ${livePhase.p2}/20 — ${livePhase.p2Details.filter(d=>!d.pass).map(d=>d.label).join(' · ')}`
+                  }
+                </div>
+              )}
             </div>
           )}
 
@@ -4082,6 +4310,36 @@ function BacktestLogTab() {
                 </div>
                 {validationErrors.full_sequence_complete && <div className="mt-1 text-xs text-red-500">Required</div>}
               </div>
+
+              {/* ── Phase 4: Pre-Entry Strength Signal ── */}
+              <div className="border border-gray-800 rounded p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-500 uppercase tracking-widest">Phase 4 — Pre-Entry Signal <span className="text-gray-700 normal-case">(optional · A+ booster)</span></span>
+                  <span className={`text-xs font-bold ${entry.p4_micro_poi_present ? 'text-green-400' : 'text-gray-600'}`}>{livePhase.p4}/10</span>
+                </div>
+                <label className="flex items-start gap-2 cursor-pointer group">
+                  <input type="checkbox" checked={!!entry.p4_micro_poi_present} onChange={ev => set('p4_micro_poi_present', ev.target.checked)}
+                    className="mt-0.5 accent-blue-500 shrink-0"/>
+                  <span className={`text-xs ${entry.p4_micro_poi_present ? 'text-gray-200' : 'text-gray-600'} group-hover:text-gray-400 transition-colors`}>
+                    Micro-POI tap (1–3 pips) with massive displacement (5+ pips) occurred 30–90 min before entry
+                  </span>
+                </label>
+                {entry.p4_micro_poi_present && (
+                  <div className="text-xs text-green-400 border border-green-800 bg-green-950/20 rounded px-2 py-1.5">
+                    +10/10 — Pre-entry strength signal confirmed. A+ upgrade eligible.
+                  </div>
+                )}
+              </div>
+
+              {/* Phase 3 live feedback */}
+              {entry.ltf_confirmation && (
+                <div className={`text-xs rounded px-3 py-2 border ${livePhase.p3Pass ? 'border-green-800 bg-green-950/20 text-green-400' : livePhase.p3 >= 15 ? 'border-yellow-800 bg-yellow-950/20 text-yellow-400' : 'border-gray-800 text-gray-600'}`}>
+                  {livePhase.p3Pass
+                    ? `✓ Phase 3: ${livePhase.p3}/30 PASS — Entry trigger confirmed`
+                    : `Phase 3: ${livePhase.p3}/30 — ${livePhase.p3Details.filter(d=>!d.pass).map(d=>d.label).join(' · ')}`
+                  }
+                </div>
+              )}
             </div>
           )}
 
@@ -4118,11 +4376,27 @@ function BacktestLogTab() {
               <div><FL>Exit Reason</FL><TG opts={O.exit} val={entry.exit_reason} onSel={v=>set('exit_reason',v)} cols={4}/></div>
               <div>
                 <div className={validationErrors.trade_grade ? 'ring-1 ring-red-500 rounded' : ''}>
-                  <FL>Trade Grade</FL>
+                  <FL>Trade Grade (manual)</FL>
                   <TG opts={O.grades} val={entry.trade_grade} onSel={v=>set('trade_grade',v)} cols={4}/>
                 </div>
                 {validationErrors.trade_grade && <div className="mt-1 text-xs text-red-500">Required</div>}
               </div>
+              {/* Phase 5 live feedback */}
+              {(entry.result || entry.r_achieved) && (
+                <div className={`text-xs rounded px-3 py-2 border ${livePhase.p5Pass ? 'border-green-800 bg-green-950/20 text-green-400' : livePhase.p5 >= 5 ? 'border-yellow-800 bg-yellow-950/20 text-yellow-400' : 'border-gray-800 text-gray-600'}`}>
+                  {livePhase.p5Pass
+                    ? `✓ Phase 5: ${livePhase.p5}/20 PASS — Exit discipline confirmed`
+                    : `Phase 5: ${livePhase.p5}/20 — ${livePhase.p5Details.filter(d=>!d.pass).map(d=>d.label).join(' · ')}`
+                  }
+                </div>
+              )}
+              {/* Conflict warning: user grade vs auto-grade */}
+              {entry.trade_grade && livePhase.autoGrade && entry.trade_grade !== livePhase.autoGrade && (
+                <div className="text-xs rounded px-3 py-2 border border-orange-700 bg-orange-950/20 text-orange-300">
+                  ⚠ Grade mismatch — You selected <span className="font-bold">{entry.trade_grade}</span> but auto-eval scores this as <span className="font-bold">{livePhase.autoGrade}</span> ({livePhase.total}/100).
+                  If you proceed, a reason will be required at the Summary step.
+                </div>
+              )}
             </div>
           )}
 
@@ -4242,20 +4516,91 @@ function BacktestLogTab() {
           )}
 
           {/* Summary — full review before logging */}
-          {currentId === 'summary' && (
+          {currentId === 'summary' && (() => {
+            const pgb = phaseBand(livePhase.autoGrade);
+            const gradeConflict = entry.trade_grade && livePhase.autoGrade && entry.trade_grade !== livePhase.autoGrade;
+            const phaseRows = [
+              { label:'Phase 1', sub:'HTF Structure',       score:livePhase.p1,  max:20, pass:livePhase.p1Pass,  details:livePhase.p1Details },
+              { label:'Phase 2', sub:'Inducement + Sweep',  score:livePhase.p2,  max:20, pass:livePhase.p2Pass,  details:livePhase.p2Details },
+              { label:'Phase 3', sub:'Entry Trigger',       score:livePhase.p3,  max:30, pass:livePhase.p3Pass,  details:livePhase.p3Details },
+              { label:'Phase 4', sub:'Pre-Entry Signal',    score:livePhase.p4,  max:10, pass:livePhase.p4 > 0,  details:livePhase.p4Details },
+              { label:'Phase 5', sub:'Exit Discipline',     score:livePhase.p5,  max:20, pass:livePhase.p5Pass,  details:livePhase.p5Details },
+            ];
+            return (
             <div className="space-y-4">
-              <div className={`flex items-center gap-3 border rounded p-3 ${liveBand.ring} bg-gray-950`}>
-                <span className={`font-bold text-3xl leading-none ${liveBand.color}`}>{entry.liquidity_tier && entry.displacement_quality ? liveSQS : '—'}</span>
-                <div>
-                  <div className={`font-bold text-sm ${liveBand.color}`}>{entry.liquidity_tier && entry.displacement_quality ? liveBand.grade + ' — ' + liveBand.label : '—'}</div>
-                  <div className="text-xs text-gray-600 mt-0.5">{entry.pair} {entry.direction} · {entry.date}</div>
+              {/* ── Dual grade header: SQS + Auto-Phase ── */}
+              <div className="grid grid-cols-2 gap-2">
+                <div className={`flex items-center gap-2 border rounded p-3 ${liveBand.ring} bg-gray-950`}>
+                  <span className={`font-bold text-2xl leading-none ${liveBand.color}`}>{entry.liquidity_tier && entry.displacement_quality ? liveSQS : '—'}</span>
+                  <div>
+                    <div className={`font-bold text-xs ${liveBand.color}`}>SQS {entry.liquidity_tier && entry.displacement_quality ? liveBand.grade : ''}</div>
+                    <div className="text-xs text-gray-700">Sweep quality score</div>
+                  </div>
                 </div>
-                <div className="ml-auto flex flex-col gap-1 items-end">
-                  {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ Override Applied</span>}
-                  {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
-                  {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Auto NO TRADE</span>}
+                <div className={`flex items-center gap-2 border rounded p-3 ${pgb.ring} ${pgb.bg}`}>
+                  <span className={`font-bold text-2xl leading-none ${pgb.color}`}>{livePhase.total}</span>
+                  <div>
+                    <div className={`font-bold text-xs ${pgb.color}`}>Auto Grade: {livePhase.autoGrade}</div>
+                    <div className="text-xs text-gray-700">5-phase eval score</div>
+                  </div>
                 </div>
               </div>
+
+              {/* ── Phase breakdown ── */}
+              <div className="border border-gray-800 rounded overflow-hidden">
+                <div className="px-3 py-2 bg-gray-900/60 border-b border-gray-800 flex items-center justify-between">
+                  <span className="text-xs text-gray-500 uppercase tracking-widest">5-Phase Evaluation</span>
+                  <span className={`text-xs font-bold ${pgb.color}`}>{livePhase.total}/100 → {livePhase.autoGrade}</span>
+                </div>
+                {phaseRows.map((ph, i) => (
+                  <div key={i} className="border-b border-gray-800/60 last:border-b-0">
+                    <div className="flex items-center gap-2 px-3 py-2">
+                      <span className={`text-xs font-bold w-4 ${ph.pass ? 'text-green-400' : 'text-gray-600'}`}>{ph.pass ? '✓' : '✗'}</span>
+                      <span className="text-xs text-gray-400 font-bold w-16 shrink-0">{ph.label}</span>
+                      <span className="text-xs text-gray-700 flex-1">{ph.sub}</span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <div className="w-20 bg-gray-800 rounded-full h-1.5">
+                          <div className={`h-1.5 rounded-full transition-all ${ph.pass ? 'bg-green-600' : ph.score > 0 ? 'bg-yellow-600' : 'bg-gray-700'}`}
+                            style={{ width: `${Math.round((ph.score / ph.max) * 100)}%` }}/>
+                        </div>
+                        <span className={`text-xs font-bold w-10 text-right ${ph.pass ? 'text-green-400' : ph.score > 0 ? 'text-yellow-400' : 'text-gray-600'}`}>
+                          {ph.score}/{ph.max}
+                        </span>
+                      </div>
+                    </div>
+                    {/* Failed checkpoints */}
+                    {!ph.pass && ph.details.filter(d=>!d.pass).length > 0 && (
+                      <div className="px-8 pb-2 space-y-0.5">
+                        {ph.details.filter(d=>!d.pass).map((d, j) => (
+                          <div key={j} className="text-xs text-gray-700">✗ {d.label}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* ── Grade conflict warning + override reason ── */}
+              {gradeConflict && (
+                <div className="border border-orange-700 bg-orange-950/20 rounded p-3 space-y-2">
+                  <div className="text-xs text-orange-300 font-bold">
+                    ⚠ Grade Conflict — You selected <span className="text-white">{entry.trade_grade}</span> but auto-eval scored <span className="text-white">{livePhase.autoGrade}</span> ({livePhase.total}/100 pts)
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    {livePhase.p1Pass && livePhase.p2Pass && livePhase.p3Pass
+                      ? 'Phases 1–3 passed. Review Phase 4/5 for upgrade/downgrade reason.'
+                      : !livePhase.p1Pass ? 'Phase 1 failed — HTF structure not fully confirmed.'
+                      : !livePhase.p2Pass ? 'Phase 2 failed — Inducement or sweep incomplete.'
+                      : 'Phase 3 failed — Entry trigger not fully confirmed.'}
+                  </div>
+                  <div>
+                    <FL>Override Reason (required)</FL>
+                    <TA2 val={entry.phase_override_reason} onChg={v=>set('phase_override_reason',v)} ph={`Why is your ${entry.trade_grade} grade correct vs auto-eval ${livePhase.autoGrade}?`}/>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Trade data summary rows ── */}
               <div className="border border-gray-800 rounded p-3 space-y-0.5">
                 <SumRow label="Pair / Direction" val={`${entry.pair} ${entry.direction}`}/>
                 <SumRow label="Date / Session" val={`${entry.date} · ${entry.session}`}/>
@@ -4270,7 +4615,9 @@ function BacktestLogTab() {
                 <SumRow label="Entry / Stop" val={entry.entry_price?`${entry.entry_price} → ${entry.stop_price} (${entry.stop_distance_pips}p)`:null}/>
                 <SumRow label="Target RR" val={entry.target_rr?`${entry.target_rr}R`:null}/>
                 <SumRow label="Result" val={entry.result?`${entry.result}${entry.r_achieved?` · ${entry.r_achieved}R`:''}`:null}/>
-                <SumRow label="Trade Grade" val={entry.trade_grade}/>
+                <SumRow label="User Grade" val={entry.trade_grade}/>
+                <SumRow label="Auto Grade" val={`${livePhase.autoGrade} (${livePhase.total}/100)`}/>
+                <SumRow label="Pre-Entry Signal" val={entry.p4_micro_poi_present ? '✓ Present (+10)' : 'Absent'}/>
                 <SumRow label="Rules Triggered" val={entry.rule_triggered === 'NONE' ? 'None' : (entry.rule_triggered||[]).length?(entry.rule_triggered||[]).join(', '):null}/>
                 <SumRow label="Warning Signal" val={
                   entry.warning_signal_present === true ? `Yes · Acted on: ${entry.warning_signal_acted_on===true?'Yes':entry.warning_signal_acted_on===false?'No':'—'}` :
@@ -4278,12 +4625,18 @@ function BacktestLogTab() {
                   entry.warning_signal_present === 'none' ? 'No Warning' : null
                 }/>
               </div>
+              <div className="flex items-center gap-2">
+                {overrideApplied && <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-2 py-0.5">⚠ SQS Override −8</span>}
+                {entry.bias_aligned === false && <span className="text-xs border border-yellow-700 bg-yellow-950/20 text-yellow-400 rounded px-2 py-0.5">⚠ Bias Unaligned</span>}
+                {entry.liquidity_tier && entry.displacement_quality && liveSQS < 40 && liveSQS > 0 && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 SQS Auto NO TRADE</span>}
+                {(!livePhase.p1Pass || !livePhase.p2Pass) && <span className="text-xs border border-red-700 bg-red-950/20 text-red-400 rounded px-2 py-0.5">🔴 Phase Auto NO TRADE</span>}
+              </div>
               {saveState === 'error' && (
                 <div className="text-xs text-red-400 border border-red-800 bg-red-950/20 rounded px-3 py-2">❌ Save failed — check browser console.</div>
               )}
               {saveState === 'saved' && (
                 <div className="text-xs text-green-400 border border-green-800 bg-green-950/20 rounded px-3 py-2">
-                  ✓ Logged — SQS {sqsScore} ({sqsScore != null ? sqsBand(sqsScore).grade : '—'}). Add counterfactual below once the trade plays out.
+                  ✓ Logged — SQS {sqsScore} ({sqsScore != null ? sqsBand(sqsScore).grade : '—'}) · Auto Grade: {livePhase.autoGrade} ({livePhase.total}/100). Add counterfactual below once the trade plays out.
                 </div>
               )}
               <button onClick={handleSave} disabled={saveState === 'saving'}
@@ -4294,7 +4647,8 @@ function BacktestLogTab() {
                 {saveState === 'saving' ? 'Saving…' : '📓 LOG BACKTEST ENTRY'}
               </button>
             </div>
-          )}
+            );
+          })()}
 
           {/* ── Navigation ─────────────────────────────────────────── */}
           <div className="flex gap-2 mt-6 pt-4 border-t border-gray-800">
@@ -4374,6 +4728,7 @@ function BacktestLogTab() {
               {recentLogs.length === 0 && <div className="px-4 py-3 text-xs text-gray-700">No entries yet.</div>}
               {recentLogs.map(log => {
                 const b      = log.sqs_score != null ? sqsBand(log.sqs_score) : { grade:'—', color:'text-gray-600', ring:'border-gray-800' };
+                const agb    = log.auto_grade ? phaseBand(log.auto_grade) : null;
                 const needCF = log.setup_played_out == null;
                 return (
                   <div key={log.id} className="border-b border-gray-800/50 last:border-b-0 px-4 py-3">
@@ -4383,11 +4738,19 @@ function BacktestLogTab() {
                       <span className={`text-xs font-medium ${log.direction==='Long'?'text-green-500':'text-red-500'}`}>{log.direction||'—'}</span>
                       <span className="text-gray-600 text-xs">{log.date||'—'}</span>
                       <span className="text-gray-600 text-xs truncate max-w-[100px]">{log.sequence_type||'—'}</span>
-                      <div className="flex items-center gap-1.5 ml-auto">
+                      <div className="flex items-center gap-1.5 ml-auto flex-wrap justify-end">
                         {log.sqs_score != null && (
                           <span className={`text-xs font-bold border rounded px-1.5 py-0.5 ${b.color} ${b.ring}`}>
                             {log.sqs_score} {b.grade}
                           </span>
+                        )}
+                        {log.auto_grade && agb && (
+                          <span className={`text-xs font-bold border rounded px-1.5 py-0.5 ${agb.color} ${agb.ring}`}>
+                            {log.phase_total_score}p {log.auto_grade}
+                          </span>
+                        )}
+                        {log.grade_conflict && (
+                          <span className="text-xs border border-orange-700 bg-orange-950/20 text-orange-400 rounded px-1.5 py-0.5">⚠ Grade Conflict</span>
                         )}
                         <span className={`text-xs font-medium px-1.5 py-0.5 rounded border ${
                           log.result==='Win'  ? 'text-green-400 border-green-900 bg-green-950/20' :
