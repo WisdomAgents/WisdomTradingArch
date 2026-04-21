@@ -3092,16 +3092,17 @@ function calculatePhaseScores(e) {
   // ── Phase 3: Entry Trigger Confirmation (0–30 pts) ───────────────
   let p3 = 0;
   const p3Details = [];
-  // Checkpoint 1 — M1 CHoCH or BOS after sweep (10pts)
-  const hasLtfConfirm = e.ltf_confirmation === 'M1 CHoCH' || e.ltf_confirmation === 'M1 BOS';
-  if (hasLtfConfirm)   { p3 += 10; p3Details.push({ label:'M1 CHoCH / BOS confirmed', pass:true }); }
-  else                   p3Details.push({ label:'M1 CHoCH / BOS not confirmed', pass:false });
+  // Checkpoint 1 — LTF confirmation present (Engulf, M1 CHoCH, M1 BOS) (10pts)
+  const ltfVal = (e.ltf_confirmation || '').toLowerCase();
+  const hasLtfConfirm = ltfVal === 'm1 choch' || ltfVal === 'm1 bos' || ltfVal === 'engulf';
+  if (hasLtfConfirm)   { p3 += 10; p3Details.push({ label:'LTF confirmation confirmed', pass:true }); }
+  else                   p3Details.push({ label:'LTF confirmation not present', pass:false });
   // Checkpoint 2 — Entry inside fresh POI or HTF retest (10pts)
-  const formationEntry = e.poi_type === 'HTF' && isCont;
-  const retestEntry    = e.poi_type === 'HTF' && isRev;
-  if (formationEntry || retestEntry || e.poi_type === 'HTF')
+  // Normalise to uppercase for comparison — data may be stored as 'HTF', 'htf', etc.
+  const poiTypeNorm = (e.poi_type || '').toUpperCase();
+  if (poiTypeNorm === 'HTF')
                        { p3 += 10; p3Details.push({ label:`${isRev?'HTF retest':'Formation'} entry confirmed`, pass:true }); }
-  else if (e.poi_type === 'LTF')
+  else if (poiTypeNorm === 'LTF')
                        { p3 += 5;  p3Details.push({ label:'LTF POI entry (partial)', pass:false }); }
   else                   p3Details.push({ label:'POI entry type needed', pass:false });
   // Checkpoint 3 — Entry timing = killzone open (10pts)
